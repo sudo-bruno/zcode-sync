@@ -103,6 +103,7 @@ class State:
         if not isinstance(d, dict):
             d = {}
         d.setdefault("exported", {})
+        d.setdefault("imported", {})
         d.setdefault("options", {})
         self.d = d
 
@@ -175,10 +176,13 @@ def export(root, data_dir, opts=None, force_all=False):
     conn = ro(db)
     conn.row_factory = sqlite3.Row
     tasks = load_tasks(root)
-    exported, skipped, archived_skipped, errors = 0, 0, 0, []
+    exported, skipped, archived_skipped, imported_skipped, errors = 0, 0, 0, 0, []
     total_bytes = 0
     for row in conn.execute("select id, time_updated, time_archived from session"):
         sid, tu = row["id"], row["time_updated"]
+        if sid in state.d["imported"]:
+            imported_skipped += 1  # sessão veio de outra máquina: o dono é quem a criou
+            continue
         if row["time_archived"] is not None and not opts["with_archived"]:
             archived_skipped += 1
             continue
@@ -210,6 +214,8 @@ def export(root, data_dir, opts=None, force_all=False):
     total_size = sum(os.path.getsize(p) for p in files)
     lines = ["sessões: %d exportadas (%s), %d sem mudanças, %d arquivos no total (%s)" %
              (exported, human(total_bytes), skipped, len(files), human(total_size))]
+    if imported_skipped:
+        lines.append("%d sessão(ões) importada(s) não re-exportada(s) — o dono é a máquina de origem" % imported_skipped)
     if archived_skipped:
         lines.append("%d sessão(ões) arquivada(s) fora do recorte (--with-archived inclui)" % archived_skipped)
     if errors:
@@ -296,6 +302,7 @@ def import_sessions(root, data_dir, backup=True):
         ]}
     lines, errors = [], []
     new, existing, enriched, tasks_in = 0, 0, 0, 0
+    state = State(data_dir)
     bkp = backup_db(db) if backup else None
     conn = sqlite3.connect(db, timeout=15)
     conn.execute("pragma busy_timeout = 15000")
@@ -311,6 +318,7 @@ def import_sessions(root, data_dir, backup=True):
                     existed, counts = import_bundle(conn, bundle)
                     if bundle.get("task"):
                         tasks_in += import_task(root, bundle["task"])
+                state.d["imported"][sid] = now_stamp()
                 if existed:
                     existing += 1
                     enriched += sum(v for k, v in counts.items() if k != "session")
@@ -324,6 +332,7 @@ def import_sessions(root, data_dir, backup=True):
                 errors.append("%s: %s" % (sid, e))
     finally:
         conn.close()
+    state.save()
     if bkp:
         lines.append("backup do banco: %s" % bkp)
     lines.append("sessões: %d novas, %d já existiam%s" %

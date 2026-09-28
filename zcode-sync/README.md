@@ -13,14 +13,13 @@ Plugin ZCode que sincroniza seus recursos entre máquinas usando o Google Drive 
 |---|---|
 | `~/.zcode/skills/` | `~/.zcode/cli/config.json` (hooks/MCP da máquina) |
 | `~/.zcode/agents/` | `~/.zcode/cli/db` (o banco não viaja; sessões vão por `cli/sessions-export/`) |
-| `~/.zcode/commands/` | `~/.zcode/v2/credentials.json` (sessão de login) |
+| `~/.zcode/commands/` | `~/.zcode/v2/credentials.json` (login) e `v2/config.json`/`v2/provider_config.json` (providers: **por máquina**) |
 | `~/.zcode/AGENTS.md` | `~/.zcode/v2/setting.json` (UI, por máquina) |
 | `~/.zcode/cli/memories/` | `~/.zcode/workspace/` e cache de plugins |
-| `~/.zcode/v2/config.json` + `v2/provider_config.json` (providers e chaves de API) | |
-| `~/.zcode/cli/sessions-export/` (sessões em JSON — ver abaixo) | |
+| `~/.zcode/cli/sessions-export/` (sessões em gzip — ver abaixo) | |
 | `~/.zcode/zsync-projects.json` (manifesto de projetos) | |
 
-Arquivos de config recebem **backup automático** antes de qualquer sobrescrita ou deleção (`config.json.zsync-backup-<data>`, mantidos os 5 últimos por arquivo, permissão 0600). Os backups ficam só na máquina e nunca entram no sync. `v2/credentials.json` (token de login da conta) fica de fora de propósito: sincronizar sessão de login pode derrubar o login de uma das máquinas na rotação de tokens — cada máquina loga uma vez, como sempre.
+**Providers são por máquina:** `v2/config.json`, `v2/provider_config.json` e `v2/credentials.json` **não** sincronizam — a versão 0.6.x chegou a sincronizar os dois primeiros e isso sobrescreveu as regras de provider de uma ponta com as da outra (corrigido no 0.6.2). Backups automáticos (`*.zsync-backup-<data>`, 0600) continuam como rede de segurança para esses arquivos.
 
 Ignora `.DS_Store`, `__pycache__`, `*.pyc`, links simbólicos e as cópias `*.sync-conflict-*` (que são locais de cada máquina).
 
@@ -72,7 +71,8 @@ O ZCode não observa as pastas de recursos (não existe watcher) — skills/agen
 
 O banco de sessões (sqlite) não viaja — não existe formato de merge para ele. Em vez disso o plugin **exporta cada sessão para um arquivo comprimido** (`.json.gz`, gzip determinístico) em `~/.zcode/cli/sessions-export/` (id UUID = nunca colide entre máquinas) e o sync leva esses arquivos como qualquer outro. Na outra máquina, `/zsync:sessions import` aplica o que falta por `INSERT OR IGNORE`: só adiciona, nunca altera nem apaga nada existente; faz backup do banco antes (mantém os 2 últimos) e funciona melhor com o ZCode fechado — as sessões aparecem após reiniciar o app.
 
-- Recorte padrão (enxuto): **sem outputs de ferramenta** (~85% do peso), **sem tabelas de estatísticas**, **sem checkpoints** (apontam para artefatos que não viajam) e **sem sessões arquivadas**. Medido no seu histórico real: 384 MB → **68 MB** sem perder o conteúdo das conversas.
+- Recorte padrão (enxuto): **sem outputs de ferramenta** (~85% do peso), **sem tabelas de estatísticas**, **sem checkpoints** (apontam para artefatos que não viajam) e **sem sessões arquivadas**. Medido no histórico real: 384 MB → **68 MB** sem perder o conteúdo das conversas.
+- **Sessões importadas não são re-exportadas** pela máquina que as importou — o dono de cada sessão é a máquina que a criou (evita conflito quando a mesma sessão existe nas duas pontas).
 - Mais cortes/inclusões: `--no-reasoning` remove também o "pensamento" do modelo; `--with-tool`, `--with-usage`, `--with-checkpoints`, `--with-archived` trazem de volta (importar depois enriquece sem duplicar).
 - Re-exportar sem mudanças gera **bytes idênticos** (gzip com timestamp fixo): nada trafega de novo.
 - O export roda sozinho antes de cada sync (manual e automático) e é incremental: só sessões novas/alteradas.
@@ -112,7 +112,8 @@ Na primeira tela de login o Google mostra o aviso "app não verificado" — norm
 - O refresh token fica no **Keychain do macOS**; no Linux, num arquivo com permissão 0600 no diretório de dados do plugin.
 - Todas as chamadas vão por HTTPS para `accounts.google.com`, `oauth2.googleapis.com` e `www.googleapis.com`.
 - Whitelist com verificação de caminho: nada fora das pastas listadas é lido ou gravado.
-- **Chaves de API dos providers viajam pelo seu Drive privado** (decisão sua, como no backup do WhatsApp). Os backups locais de config ficam com permissão 0600.
+- Whitelist com verificação de caminho: nada fora das pastas listadas é lido ou gravado.
+- **Chaves de API ficam em cada máquina** (configs de provider não viajam). O que vai ao Drive é apenas o conteúdo listado na whitelist.
 - **Os arquivos de sessão contêm o texto das conversas** (sem outputs de ferramenta por padrão) e viajam pelo mesmo Drive privado — o export local também fica 0600.
 - O `client_secret` de um OAuth client tipo Desktop não é tratado como confidencial pelo Google (apps instalados não conseguem guardar segredos — por isso apps como o WhatsApp embutem o próprio). Ainda assim, mantenha este repositório privado; o GitHub Push Protection pode bloquear o primeiro push por causa dele — use os links de "unblock" que o próprio GitHub oferece.
 

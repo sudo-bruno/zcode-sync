@@ -41,11 +41,14 @@ DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3"
 SCOPES = "openid email https://www.googleapis.com/auth/drive.appdata"
 
 # Whitelist fechada: só isto sincroniza. Nada de cli/config.json, cli/db, v2/credentials.json, workspace/.
+# v2/config.json e v2/provider_config.json NÃO sincronizam (0.6.2): providers são
+# por máquina — sincronizar sobrescreveu a config de uma ponta com a da outra.
 SYNC_ROOTS = ["skills", "agents", "commands", "AGENTS.md", os.path.join("cli", "memories"),
-              "v2/config.json", "v2/provider_config.json",
               os.path.join("cli", "sessions-export"), "zsync-projects.json"]
-SINGLE_FILES = {"AGENTS.md", "v2/config.json", "v2/provider_config.json", "zsync-projects.json"}
-# Arquivos de config (contêm chaves de API): backup local antes de sobrescrever ou deletar.
+SINGLE_FILES = {"AGENTS.md", "zsync-projects.json"}
+# Nunca tocados pelo sync, mesmo se entrarem no manifesto por uma máquina antiga.
+NEVER_SYNC = {"v2/config.json", "v2/provider_config.json"}
+# Arquivos de config: backup local antes de qualquer sobrescrita/deleção (rede de segurança).
 PROTECTED_FILES = {"v2/config.json", "v2/provider_config.json"}
 
 IGNORE_NAMES = {".DS_Store", "__pycache__", ".git"}
@@ -932,6 +935,8 @@ def run_sync(ctx):
     if lrv == remote.get("version"):
         new_files = {}
         for p in sorted(set(remote.get("files", {})) | set(local)):
+            if p in NEVER_SYNC:
+                continue
             lentry = local.get(p)
             rentry = remote["files"].get(p)
             cp = pending.get(p)
@@ -980,6 +985,8 @@ def run_sync(ctx):
     converged_base = {}          # novo base para caminhos não conflitados
 
     for p in sorted(set(base) | set(remote.get("files", {})) | set(local)):
+        if p in NEVER_SYNC:
+            continue
         bsha = base.get(p)
         lentry = local.get(p)
         rentry = (remote.get("files", {}) or {}).get(p)

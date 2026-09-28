@@ -240,22 +240,16 @@ def integration():
         check("t10: m2 propaga o binário resolvido", r["ok"] and r["pushed"], str(r))
         lab.run("m1", "sync")
 
-        # t12 — config de providers: sincroniza, backup ao sobrescrever, backup fora do scan
-        import glob as _glob
-        lab.write("m1", "v2/config.json", '{"provider":{"x":{"options":{"apiKey":"v1"}}}}\n')
-        r = lab.run("m1", "sync")
-        check("t12: config sobe", r["ok"], str(r))
-        r = lab.run("m2", "sync")
-        check("t12: config chega na m2", lab.read("m2", "v2/config.json").startswith('{"provider"'), str(r))
-        lab.write("m1", "v2/config.json", '{"provider":{"x":{"options":{"apiKey":"v2"}}}}\n')
+        # t12 — configs de providers NÃO sincronizam (por máquina; incidente de overwrite 0.6.x)
+        lab.write("m1", "v2/config.json", '{"provider":{"x":{"options":{"apiKey":"m1"}}}}\n')
+        lab.write("m2", "v2/config.json", '{"provider":{"x":{"options":{"apiKey":"m2"}}}}\n')
         lab.run("m1", "sync")
         r = lab.run("m2", "sync")
-        check("t12: m2 aplica versão nova", '"apiKey":"v2"' in lab.read("m2", "v2/config.json"), str(r))
-        bks = _glob.glob(os.path.join(lab.root("m2"), "v2", "config.json" + ".zsync-backup-*"))
-        check("t12: backup do conteúdo antigo criado",
-              len(bks) == 1 and '"apiKey":"v1"' in open(bks[0]).read(), str(bks))
-        r = lab.run("m2", "status")
-        check("t12: backup não entra no scan", r["ok"] and "zsync-backup" not in " ".join(r["lines"]), str(r["lines"])[:200])
+        check("t12: config não sincroniza (cada máquina mantém a sua)",
+              lab.read("m2", "v2/config.json") == '{"provider":{"x":{"options":{"apiKey":"m2"}}}}\n',
+              repr(lab.read("m2", "v2/config.json")))
+        check("t12: config não entrou no remoto",
+              not any(e.get("path") == "v2/config.json" for e in r["events"]), str(r["events"])[:200])
 
         # t13 — regressão: rebase + arquivo novo local (era falso modify/delete)
         lab.write("m1", "agents/novo-m1.md", "novo do m1\n")
@@ -537,11 +531,13 @@ def unit_sessions():
         _mk_sessions_pair(src, with_task=True)
         _mk_empty_pair(tgt)
         sess = os.path.join(HERE, "..", "scripts", "sessions.py")
-        data = os.path.join(base, "data")
-        os.makedirs(data)
+        data_src, data_tgt = os.path.join(base, "data-src"), os.path.join(base, "data-tgt")
+        os.makedirs(data_src)
+        os.makedirs(data_tgt)
 
         def run(root, *a):
-            return subprocess.run([sys.executable, sess, "--root", root, "--data", data] + list(a),
+            d = data_src if root == src else data_tgt
+            return subprocess.run([sys.executable, sess, "--root", root, "--data", d] + list(a),
                                   capture_output=True, text=True, timeout=60)
 
         def sync_bring():
@@ -597,6 +593,9 @@ def unit_sessions():
         check("sessions: task importada",
               sqlite3.connect(os.path.join(tgt, "v2", "tasks-index.sqlite"))
               .execute("select count(*) from tasks").fetchone()[0] == 1)
+        r = run(tgt, "export")
+        check("sessions: importadas não são re-exportadas pela máquina que importou",
+              "0 exportadas" in r.stdout and "não re-exportada" in r.stdout, r.stdout)
 
         r = run(src, "export", "--with-tool")
         check("sessions: --with-tool re-exporta", "2 exportadas" in r.stdout, r.stdout)
@@ -631,7 +630,7 @@ def unit_sessions():
         r = run(tgt, "status")
         check("sessions: status ok", r.returncode == 0 and "exportadas" in r.stdout, r.stdout)
 
-        r = subprocess.run([sys.executable, SCRIPT, "--root", src, "--data", data, "sessions", "status"],
+        r = subprocess.run([sys.executable, SCRIPT, "--root", src, "--data", data_src, "sessions", "status"],
                            capture_output=True, text=True, timeout=60)
         check("wiring: zsync.py sessions status", r.returncode == 0 and "sessões" in r.stdout,
               r.stdout + r.stderr)
