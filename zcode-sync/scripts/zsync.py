@@ -662,6 +662,7 @@ def _add_file(files, root, fpath):
 class Ctx:
     def __init__(self, args):
         self.root = os.path.abspath(args.root or os.path.join(os.path.expanduser("~"), ".zcode"))
+        self.compact = bool(getattr(args, "compact", False))
         data_dir = args.data or os.environ.get("ZCODE_PLUGIN_DATA")
         if not data_dir:
             # auto-detecta o diretório de dados oficial do plugin (zcode-sync@<mercado>),
@@ -737,18 +738,36 @@ def make_backend(args):
     raise SyncError("--backend desconhecido: %s (use file:<dir>)" % spec)
 
 
-def acquire_lock(data_dir):
+def acquire_lock(data_dir, wait_seconds=None):
+    """Cria o lock. Se outro sync está rodando, espera até wait_seconds (padrão 180s,
+    env ZSYNC_LOCK_WAIT) antes de desistir — evita erro quando auto-sync e comando
+    manual coincidem."""
+    if wait_seconds is None:
+        try:
+            wait_seconds = float(os.environ.get("ZSYNC_LOCK_WAIT", "180"))
+        except ValueError:
+            wait_seconds = 180.0
     path = os.path.join(data_dir, LOCK_FILE)
-    if os.path.exists(path):
-        stale = time.time() - os.path.getmtime(path) > 600
-        if stale:
-            os.remove(path)
-        else:
-            raise SyncError("outro sync está em andamento nesta máquina (lock ativo)")
-    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    os.write(fd, str(os.getpid()).encode())
-    os.close(fd)
-    return path
+    deadline = time.time() + max(0.0, wait_seconds)
+    while True:
+        if os.path.exists(path):
+            if time.time() - os.path.getmtime(path) > 600:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            elif time.time() >= deadline:
+                raise SyncError("outro sync está em andamento nesta máquina — tente de novo em instantes")
+            else:
+                time.sleep(1)
+                continue
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            continue
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return path
 
 
 def release_lock(path):
@@ -767,7 +786,7 @@ class Report:
     def add(self, kind, path, detail=""):
         self.events.append({"type": kind, "path": path, "detail": detail})
 
-    def summary_lines(self):
+    def summary_lines(self, compact=False):
         order = ["first-push", "baixado", "mesclado", "removido-local", "enviado",
                  "alterado-remoto", "deletado-remoto", "conflito", "push", "retry", "aviso"]
         labels = {
@@ -790,8 +809,11 @@ class Report:
                 continue
             lines.append("")
             lines.append("%s (%d):" % (labels.get(kind, kind), len(evs)))
-            for e in evs:
+            shown = evs if not compact or len(evs) <= 15 else evs[:12]
+            for e in shown:
                 lines.append("  %s%s" % (e["path"], (" — " + e["detail"]) if e["detail"] else ""))
+            if len(shown) != len(evs):
+                lines.append("  … (+%d)" % (len(evs) - len(shown)))
         return lines
 
 
@@ -1022,7 +1044,7 @@ def cmd_sync(ctx, args_json):
             try:
                 report, pushed = run_sync(ctx)
                 lines = ["Sincronização concluída (%s)." % ctx.device]
-                lines += report.summary_lines()
+                lines += report.summary_lines(compact=ctx.compact)
                 if not report.events:
                     lines.append("Nada a fazer: máquina já em dia com o remoto.")
                 return out(args_json, ok=True, lines=lines,
@@ -1167,6 +1189,7 @@ def main(argv):
     ap.add_argument("--backend", help="backend de teste: file:<dir> (padrão: Google Drive)")
     ap.add_argument("--device", help="nome do dispositivo (padrão: nome do computador)")
     ap.add_argument("--json", action="store_true", help="saída JSON para o agente")
+    ap.add_argument("--compact", action="store_true", help="listagens resumidas (usado pelos hooks)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("login")
     sub.add_parser("logout")

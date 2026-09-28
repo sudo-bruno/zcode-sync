@@ -24,6 +24,18 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${ZCODE_PLUGIN_ROOT}/scripts/prompt_hook.py\"",
+            "timeoutMs": 600000,
+            "statusMessage": "zcode-sync: executando comando"
+          }
+        ]
+      }
     ]
   }
 }

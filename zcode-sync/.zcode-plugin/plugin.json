@@ -1,8 +1,7 @@
 {
   "name": "zcode-sync",
-  "version": "0.2.1",
-  "description": "Sincroniza skills, agents, commands, AGENTS.md e memórias do agente entre máquinas via Google Drive, com merge estilo git. Automático: hooks sincronizam no início da sessão e após respostas (em segundo plano). Comandos /zsync:login, /zsync:sync, /zsync:status, /zsync:resolve, /zsync:logout.",
-  "description": "Sincroniza skills, agents, commands, AGENTS.md e memórias do agente entre máquinas via Google Drive, com merge estilo git. Comandos /zsync:login, /zsync:sync, /zsync:status, /zsync:resolve, /zsync:logout.",
+  "version": "0.3.0",
+  "description": "Sincroniza skills, agents, commands, AGENTS.md e memórias do agente entre máquinas via Google Drive, com merge estilo git. Sincroniza sozinho via hooks (início de sessão e após respostas) e os comandos /zsync:* executam sem passar pelo modelo. Comandos: /zsync:login, /zsync:sync, /zsync:status, /zsync:resolve, /zsync:logout.",
   "author": { "name": "Bruno" },
   "commands": "./commands",
   "skills": "./skills"

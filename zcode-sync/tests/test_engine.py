@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "scripts", "zsync.py")
@@ -281,10 +282,87 @@ def unit_auto_sync():
         shutil.rmtree(dd, ignore_errors=True)
 
 
+def unit_prompt_hook():
+    """prompt_hook: marcador executa o motor e bloqueia (exit 2); o resto passa (exit 0)."""
+    tmp = tempfile.mkdtemp(prefix="zsync-hook-")
+    try:
+        engine = os.path.join(tmp, "fake_engine.py")
+        with open(engine, "w") as f:
+            f.write("import sys\nprint('ENGINE', ' '.join(sys.argv[1:]))\n")
+        failing = os.path.join(tmp, "failing_engine.py")
+        with open(failing, "w") as f:
+            f.write("import sys\nsys.stderr.write('boom')\nsys.exit(1)\n")
+        hook = os.path.join(HERE, "..", "scripts", "prompt_hook.py")
+
+        def run_hook(prompt, engine_path=engine):
+            env = dict(os.environ, ZSYNC_ENGINE=engine_path)
+            return subprocess.run([sys.executable, hook], input=json.dumps({"prompt": prompt}),
+                                  capture_output=True, text=True, env=env, timeout=30)
+
+        r = run_hook("conversa normal, sem marcador")
+        check("hook: prompt comum passa direto", r.returncode == 0 and not r.stderr.strip(), r.stderr[:200])
+
+        r = run_hook("Run custom command /zsync:sync.\nCommand source: user/plugin.\nzsync-cmd:sync  \n")
+        check("hook: sync interceptado (exit 2)", r.returncode == 2 and "ENGINE --compact sync" in r.stderr, r.stderr[:200])
+
+        r = run_hook("zsync-cmd:status x")
+        check("hook: status roda sem repassar args", r.returncode == 2 and "ENGINE status" in r.stderr, r.stderr[:200])
+
+        r = run_hook("zsync-cmd:resolve agents/a.md take-theirs")
+        check("hook: resolve com caminho e escolha",
+              r.returncode == 2 and "ENGINE resolve --path agents/a.md --choice take-theirs" in r.stderr, r.stderr[:200])
+
+        r = run_hook("zsync-cmd:resolve")
+        check("hook: resolve sem args lista conflitos",
+              r.returncode == 2 and "ENGINE --compact conflicts" in r.stderr, r.stderr[:200])
+
+        r = run_hook("zsync-cmd:resolve a b c d")
+        check("hook: resolve com args inválidos mostra uso",
+              r.returncode == 2 and "Uso:" in r.stderr and "ENGINE" not in r.stderr, r.stderr[:200])
+
+        r = run_hook("zsync-cmd:sync", engine_path=failing)
+        check("hook: falha do motor ainda bloqueia (nunca vai pro modelo)",
+              r.returncode == 2 and "boom" in r.stderr, r.stderr[:200])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def unit_lock():
+    """Lock: sync concorrente espera e falha com erro claro; lock velho é roubado."""
+    base = tempfile.mkdtemp(prefix="zsync-lock-")
+    try:
+        root = os.path.join(base, "root")
+        os.makedirs(os.path.join(root, "skills"))
+        with open(os.path.join(root, "skills", "a.md"), "w") as f:
+            f.write("x\n")
+        data = os.path.join(base, "data")
+        os.makedirs(data)
+        backend = os.path.join(base, "backend")
+        os.makedirs(backend)
+        lock = os.path.join(data, "lock")
+        with open(lock, "w") as f:
+            f.write("999")
+        env = dict(os.environ, ZSYNC_LOCK_WAIT="1")
+        args = [sys.executable, SCRIPT, "--root", root, "--data", data,
+                "--backend", "file:" + backend, "--device", "t", "sync"]
+        r = subprocess.run(args, capture_output=True, text=True, env=env, timeout=30)
+        check("lock: concorrente desiste com erro claro",
+              "em andamento" in (r.stdout + r.stderr), (r.stdout + r.stderr)[:200])
+        past = time.time() - 1200
+        os.utime(lock, (past, past))
+        r = subprocess.run(args, capture_output=True, text=True, env=env, timeout=30)
+        check("lock: lock velho é roubado e o sync roda",
+              "primeira sincronização" in r.stdout, r.stdout[:200])
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
 def main():
     unit_merge3()
     unit_auth_fallback()
     unit_auto_sync()
+    unit_prompt_hook()
+    unit_lock()
     integration()
     print("")
     print("PASS: %d  FAIL: %d" % (len(PASS), len(FAIL)))
