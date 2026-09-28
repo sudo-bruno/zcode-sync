@@ -1,6 +1,6 @@
 {
   "name": "zcode-sync",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Sincroniza skills, agents, commands, AGENTS.md, memórias, configs de providers (chaves de API), sessões (export enxuto em gzip) e lista de projetos (clone/pull via git) entre máquinas via Google Drive, com merge estilo git, hooks automáticos e comandos /zsync:* sem passar pelo modelo.",
   "author": { "name": "Bruno" },
   "commands": "./commands",

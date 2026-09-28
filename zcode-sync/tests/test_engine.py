@@ -234,6 +234,11 @@ def integration():
         lab.run("m1", "sync")
         r = lab.run("m2", "sync")
         check("t10: binário vira conflito", any(e["type"] == "conflito" for e in r["events"]), str(r["events"]))
+        r = lab.run("m2", "resolve", ["--path", "skills/demo/logo.bin", "--choice", "keep-ours"])
+        check("t10: resolve do binário ok", r["ok"], str(r))
+        r = lab.run("m2", "sync")
+        check("t10: m2 propaga o binário resolvido", r["ok"] and r["pushed"], str(r))
+        lab.run("m1", "sync")
 
         # t12 — config de providers: sincroniza, backup ao sobrescrever, backup fora do scan
         import glob as _glob
@@ -251,6 +256,20 @@ def integration():
               len(bks) == 1 and '"apiKey":"v1"' in open(bks[0]).read(), str(bks))
         r = lab.run("m2", "status")
         check("t12: backup não entra no scan", r["ok"] and "zsync-backup" not in " ".join(r["lines"]), str(r["lines"])[:200])
+
+        # t13 — regressão: rebase + arquivo novo local (era falso modify/delete)
+        lab.write("m1", "agents/novo-m1.md", "novo do m1\n")
+        r = lab.run("m1", "sync")
+        check("t13: m1 sobe o novo arquivo", r["ok"] and r["pushed"], str(r))
+        lab.write("m2", "agents/novo-m2.md", "novo do m2\n")
+        r = lab.run("m2", "sync")
+        check("t13: m2 em rebase empurra o novo (sem conflito)",
+              r["ok"] and r["pushed"] and not r["conflicts"] and
+              any(e["type"] == "enviado" and e["path"] == "agents/novo-m2.md" for e in r["events"]),
+              str(r["events"])[:300])
+        r = lab.run("m1", "sync")
+        check("t13: m1 recebe os dois novos",
+              lab.exists("m1", "agents/novo-m2.md") and lab.exists("m1", "agents/novo-m1.md"), str(r))
 
         # t11 — estado final: sem conflitos não resolvidos além dos esperados
         r = lab.run("m1", "status")
@@ -348,7 +367,7 @@ def unit_prompt_hook():
 
 
 def unit_lock():
-    """Lock: sync concorrente espera e falha com erro claro; lock velho é roubado."""
+    """Lock: dono vivo nunca é roubado (mesmo velho); PID morto é roubado na hora."""
     base = tempfile.mkdtemp(prefix="zsync-lock-")
     try:
         root = os.path.join(base, "root")
@@ -360,18 +379,22 @@ def unit_lock():
         backend = os.path.join(base, "backend")
         os.makedirs(backend)
         lock = os.path.join(data, "lock")
-        with open(lock, "w") as f:
-            f.write("999")
         env = dict(os.environ, ZSYNC_LOCK_WAIT="1")
         args = [sys.executable, SCRIPT, "--root", root, "--data", data,
                 "--backend", "file:" + backend, "--device", "t", "sync"]
-        r = subprocess.run(args, capture_output=True, text=True, env=env, timeout=30)
-        check("lock: concorrente desiste com erro claro",
-              "em andamento" in (r.stdout + r.stderr), (r.stdout + r.stderr)[:200])
+
+        with open(lock, "w") as f:
+            f.write(str(os.getpid()))  # dono vivo (nós): não pode roubar
         past = time.time() - 1200
         os.utime(lock, (past, past))
         r = subprocess.run(args, capture_output=True, text=True, env=env, timeout=30)
-        check("lock: lock velho é roubado e o sync roda",
+        check("lock: processo vivo não é roubado mesmo com lock velho",
+              "em andamento" in (r.stdout + r.stderr), (r.stdout + r.stderr)[:200])
+
+        with open(lock, "w") as f:
+            f.write("999999")  # PID morto: rouba na hora
+        r = subprocess.run(args, capture_output=True, text=True, env=env, timeout=30)
+        check("lock: PID morto é roubado e o sync roda",
               "primeira sincronização" in r.stdout, r.stdout[:200])
     finally:
         shutil.rmtree(base, ignore_errors=True)

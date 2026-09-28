@@ -767,10 +767,28 @@ def make_backend(args):
     raise SyncError("--backend desconhecido: %s (use file:<dir>)" % spec)
 
 
+def _lock_owner_alive(path):
+    """True/False se o PID dono do lock existe; None se o lock é ilegível/antigo."""
+    try:
+        with open(path, "r") as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
 def acquire_lock(data_dir, wait_seconds=None):
     """Cria o lock. Se outro sync está rodando, espera até wait_seconds (padrão 180s,
-    env ZSYNC_LOCK_WAIT) antes de desistir — evita erro quando auto-sync e comando
-    manual coincidem."""
+    env ZSYNC_LOCK_WAIT) antes de desistir. Nunca rouba de um processo vivo — só de
+    PID morto (upload longo pode passar de 10 minutos)."""
     if wait_seconds is None:
         try:
             wait_seconds = float(os.environ.get("ZSYNC_LOCK_WAIT", "180"))
@@ -780,7 +798,9 @@ def acquire_lock(data_dir, wait_seconds=None):
     deadline = time.time() + max(0.0, wait_seconds)
     while True:
         if os.path.exists(path):
-            if time.time() - os.path.getmtime(path) > 600:
+            owner = _lock_owner_alive(path)
+            stale = owner is False or (owner is None and time.time() - os.path.getmtime(path) > 600)
+            if stale:
                 try:
                     os.remove(path)
                 except OSError:
@@ -986,6 +1006,14 @@ def run_sync(ctx):
                 ctx.delete_local(p)
                 final.pop(p, None)
                 report.add("removido-local", p, "deleção remota aplicada")
+            continue
+
+        if bsha is None and rsha is None:
+            # arquivo novo localmente (não existe no base nem no remoto): só empurrar
+            if lentry is not None:
+                final[p] = lentry
+                converged_base[p] = lsha
+                report.add("enviado", p, "novo arquivo")
             continue
 
         # a partir daqui o lado local mudou desde o base
