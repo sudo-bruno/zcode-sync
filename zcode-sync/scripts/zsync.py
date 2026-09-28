@@ -40,12 +40,17 @@ DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3"
 
 SCOPES = "openid email https://www.googleapis.com/auth/drive.appdata"
 
-# Whitelist fechada: só isto sincroniza. Nada de cli/config.json, cli/db, v2/, workspace/.
-SYNC_ROOTS = ["skills", "agents", "commands", "AGENTS.md", os.path.join("cli", "memories")]
+# Whitelist fechada: só isto sincroniza. Nada de cli/config.json, cli/db, v2/credentials.json, workspace/.
+SYNC_ROOTS = ["skills", "agents", "commands", "AGENTS.md", os.path.join("cli", "memories"),
+              "v2/config.json", "v2/provider_config.json"]
+SINGLE_FILES = {"AGENTS.md", "v2/config.json", "v2/provider_config.json"}
+# Arquivos de config (contêm chaves de API): backup local antes de sobrescrever ou deletar.
+PROTECTED_FILES = {"v2/config.json", "v2/provider_config.json"}
 
 IGNORE_NAMES = {".DS_Store", "__pycache__", ".git"}
 IGNORE_SUFFIXES = (".pyc",)
 CONFLICT_MARKER = ".sync-conflict-"
+BACKUP_MARKER = ".zsync-backup-"
 
 KEYCHAIN_SERVICE = "zcode-sync"
 
@@ -625,7 +630,7 @@ def scan(root):
         full = os.path.join(root, entry)
         if os.path.islink(full):
             continue
-        if entry in ("AGENTS.md",):
+        if entry in SINGLE_FILES:
             if os.path.isfile(full):
                 _add_file(files, root, full)
             continue
@@ -638,7 +643,7 @@ def scan(root):
             for name in filenames:
                 if name in IGNORE_NAMES or name.endswith(IGNORE_SUFFIXES):
                     continue
-                if CONFLICT_MARKER in name:
+                if CONFLICT_MARKER in name or BACKUP_MARKER in name:
                     continue
                 fpath = os.path.join(dirpath, name)
                 if os.path.islink(fpath):
@@ -712,15 +717,38 @@ class Ctx:
             return f.read()
 
     def write_local(self, rel, data):
-        atomic_write(self.local_path(rel), data)
+        path = self.local_path(rel)
+        if rel in PROTECTED_FILES and os.path.exists(path):
+            with open(path, "rb") as f:
+                old = f.read()
+            if old != data:
+                self._backup(path, old)
+        atomic_write(path, data)
+
+    def _backup(self, path, old):
+        """Cópia local do conteúdo antigo de arquivo de config (só nesta máquina)."""
+        dest = "%s%s%s" % (path, BACKUP_MARKER, now_stamp())
+        try:
+            atomic_write(dest, old, mode=0o600)
+        except OSError:
+            return
+        olds = sorted(glob.glob(path + BACKUP_MARKER + "*"))
+        for extra in olds[:-5]:
+            try:
+                os.remove(extra)
+            except OSError:
+                pass
 
     def delete_local(self, rel):
         p = self.local_path(rel)
         if os.path.exists(p):
+            if rel in PROTECTED_FILES:
+                with open(p, "rb") as f:
+                    self._backup(p, f.read())
             os.remove(p)
         # remove diretórios vazios deixados para trás dentro do whitelist
         d = os.path.dirname(p)
-        wl_roots = [os.path.join(self.root, r) for r in SYNC_ROOTS if r != "AGENTS.md"]
+        wl_roots = [os.path.join(self.root, r) for r in SYNC_ROOTS if r not in SINGLE_FILES]
         while d not in wl_roots and any(d.startswith(w) for w in wl_roots):
             try:
                 os.rmdir(d)

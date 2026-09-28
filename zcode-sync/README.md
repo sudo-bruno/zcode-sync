@@ -11,11 +11,14 @@ Plugin ZCode que sincroniza seus recursos entre máquinas usando o Google Drive 
 
 | Sincroniza | Nunca toca |
 |---|---|
-| `~/.zcode/skills/` | `~/.zcode/cli/config.json` (config da máquina) |
+| `~/.zcode/skills/` | `~/.zcode/cli/config.json` (hooks/MCP da máquina) |
 | `~/.zcode/agents/` | `~/.zcode/cli/db` (sessões) |
-| `~/.zcode/commands/` | `~/.zcode/v2/`, `~/.zcode/workspace/` |
-| `~/.zcode/AGENTS.md` | credenciais e tokens |
-| `~/.zcode/cli/memories/` | cache de plugins |
+| `~/.zcode/commands/` | `~/.zcode/v2/credentials.json` (sessão de login) |
+| `~/.zcode/AGENTS.md` | `~/.zcode/v2/setting.json` (projetos/UI, por máquina) |
+| `~/.zcode/cli/memories/` | `~/.zcode/workspace/` e cache de plugins |
+| `~/.zcode/v2/config.json` + `v2/provider_config.json` (providers e chaves de API) | |
+
+Arquivos de config recebem **backup automático** antes de qualquer sobrescrita ou deleção (`config.json.zsync-backup-<data>`, mantidos os 5 últimos por arquivo, permissão 0600). Os backups ficam só na máquina e nunca entram no sync. `v2/credentials.json` (token de login da conta) fica de fora de propósito: sincronizar sessão de login pode derrubar o login de uma das máquinas na rotação de tokens — cada máquina loga uma vez, como sempre.
 
 Ignora `.DS_Store`, `__pycache__`, `*.pyc`, links simbólicos e as cópias `*.sync-conflict-*` (que são locais de cada máquina).
 
@@ -87,6 +90,7 @@ Na primeira tela de login o Google mostra o aviso "app não verificado" — norm
 - O refresh token fica no **Keychain do macOS**; no Linux, num arquivo com permissão 0600 no diretório de dados do plugin.
 - Todas as chamadas vão por HTTPS para `accounts.google.com`, `oauth2.googleapis.com` e `www.googleapis.com`.
 - Whitelist com verificação de caminho: nada fora das pastas listadas é lido ou gravado.
+- **Chaves de API dos providers viajam pelo seu Drive privado** (decisão sua, como no backup do WhatsApp). Os backups locais de config ficam com permissão 0600.
 - O `client_secret` de um OAuth client tipo Desktop não é tratado como confidencial pelo Google (apps instalados não conseguem guardar segredos — por isso apps como o WhatsApp embutem o próprio). Ainda assim, mantenha este repositório privado; o GitHub Push Protection pode bloquear o primeiro push por causa dele — use os links de "unblock" que o próprio GitHub oferece.
 
 ## Problemas conhecidos
@@ -96,6 +100,7 @@ Na primeira tela de login o Google mostra o aviso "app não verificado" — norm
 - **Duas máquinas sincronizando exatamente ao mesmo tempo**: o controle otimista faz uma delas refazer o merge automaticamente; no pior caso o sync pede para tentar de novo em instantes.
 - **Memórias**: o sync assume o mesmo layout de workspace nas máquinas (o caminho de memórias é derivado do workspace). Se na segunda máquina o hash do diretório de memórias for diferente, os arquivos chegam mas o agente local não os carrega.
 - **Comandos sem modelo**: a saída aparece como uma resposta sem custo de tokens; pode surgir um aviso cosmético `hooks_prompt_block` — é esperado.
+- **Backups de config** (`*.zsync-backup-*`) ficam só na máquina e são podados para os 5 mais recentes por arquivo; eles nunca entram no sync.
 
 ## Desenvolvimento
 

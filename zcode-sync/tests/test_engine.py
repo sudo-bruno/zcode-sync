@@ -232,6 +232,23 @@ def integration():
         r = lab.run("m2", "sync")
         check("t10: binário vira conflito", any(e["type"] == "conflito" for e in r["events"]), str(r["events"]))
 
+        # t12 — config de providers: sincroniza, backup ao sobrescrever, backup fora do scan
+        import glob as _glob
+        lab.write("m1", "v2/config.json", '{"provider":{"x":{"options":{"apiKey":"v1"}}}}\n')
+        r = lab.run("m1", "sync")
+        check("t12: config sobe", r["ok"], str(r))
+        r = lab.run("m2", "sync")
+        check("t12: config chega na m2", lab.read("m2", "v2/config.json").startswith('{"provider"'), str(r))
+        lab.write("m1", "v2/config.json", '{"provider":{"x":{"options":{"apiKey":"v2"}}}}\n')
+        lab.run("m1", "sync")
+        r = lab.run("m2", "sync")
+        check("t12: m2 aplica versão nova", '"apiKey":"v2"' in lab.read("m2", "v2/config.json"), str(r))
+        bks = _glob.glob(os.path.join(lab.root("m2"), "v2", "config.json" + ".zsync-backup-*"))
+        check("t12: backup do conteúdo antigo criado",
+              len(bks) == 1 and '"apiKey":"v1"' in open(bks[0]).read(), str(bks))
+        r = lab.run("m2", "status")
+        check("t12: backup não entra no scan", r["ok"] and "zsync-backup" not in " ".join(r["lines"]), str(r["lines"])[:200])
+
         # t11 — estado final: sem conflitos não resolvidos além dos esperados
         r = lab.run("m1", "status")
         check("t11: status final m1 ok", r["ok"], str(r))
