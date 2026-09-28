@@ -63,7 +63,7 @@ def main():
             else:
                 return finish(USAGE, 2)
         elif action == "sync":
-            argv = ["--compact", "sync", "--export-sessions"]
+            argv = ["--compact", "sync", "--export-sessions", "--pull-projects"]
         elif action == "sessions":
             sub = raw_args.split()
             if len(sub) > 1 or (sub and sub[0] not in ("status", "export", "import")):
@@ -71,8 +71,8 @@ def main():
             argv = ["sessions", sub[0] if sub else "status"]
         elif action == "projects":
             sub = raw_args.split()
-            if len(sub) > 1 or (sub and sub[0] not in ("status", "scan", "clone")):
-                return finish("Uso: /zsync:projects [status|scan|clone]", 2)
+            if len(sub) > 1 or (sub and sub[0] not in ("status", "scan", "clone", "pull")):
+                return finish("Uso: /zsync:projects [status|scan|clone|pull]", 2)
             argv = ["projects", sub[0] if sub else "status"]
         elif action in ("status", "login", "logout"):
             argv = [action]

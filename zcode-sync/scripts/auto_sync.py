@@ -57,7 +57,7 @@ def spawn_sync(log):
     py = sys.executable or "python3"
     f = open(log, "a")
     subprocess.Popen(
-        [py, ZSYNC, "sync", "--export-sessions"],
+        [py, ZSYNC, "sync", "--export-sessions", "--pull-projects"],
         stdout=f, stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL, start_new_session=True,
     )

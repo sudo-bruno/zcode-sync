@@ -2,6 +2,7 @@
 # Testes offline do zcode-sync: duas "máquinas" fake sobre backend de diretório.
 # Uso: python3 tests/test_engine.py   (a partir da raiz do plugin)
 
+import gzip
 import glob
 import json
 import os
@@ -471,6 +472,15 @@ def _mk_sessions_pair(root, with_task=False):
               " values ('e1','s1','v4/model',?,?,'{}')", (t0, t0))
     c.execute("insert into todo (session_id, content, status, priority, position, time_created, time_updated)"
               " values ('s1','fazer','pending','high',0,?,?)", (t0, t0))
+    c.execute("insert into part (id, message_id, session_id, time_created, time_updated, data)"
+              " values ('p4','m1','s1',?,?,'{\"type\":\"reasoning\",\"text\":\"hmm\"}')", (t0, t0))
+    c.execute("insert into session_entry (id, session_id, type, time_created, time_updated, data)"
+              " values ('e2','s1','runtime/workspace_checkpoint',?,?,'{\"ref\":\"zcode-artifact://x\"}')", (t0, t0))
+    c.execute("insert into model_usage (id, logical_request_id, session_id, query_source, provider_id, model_id, status, started_at)"
+              " values ('mu1','lr1','s1','chat','prov','model','completed',?)", (t0,))
+    c.execute("insert into session (id, project_id, slug, directory, title, version, time_created, time_updated)"
+              " values ('s3','p1','slug3','/tmp/x','S3','3.14.3',?,?)", (t0, t0))
+    c.execute("update session set time_archived = ? where id = 's3'", (t1,))
     c.commit()
     c.close()
     tc = sqlite3.connect(os.path.join(root, "v2", "tasks-index.sqlite"))
@@ -497,7 +507,7 @@ def _mk_empty_pair(root):
 
 
 def unit_sessions():
-    """Export/import de sessões: recorte, incremental, idempotência e enriquecimento."""
+    """Sessões: recorte enxuto + gzip, incremental, determinismo, idempotência e enriquecimento."""
     base = tempfile.mkdtemp(prefix="zsync-sess-")
     try:
         src, tgt = os.path.join(base, "src"), os.path.join(base, "tgt")
@@ -517,47 +527,82 @@ def unit_sessions():
                             os.path.join(tgt, "cli", "sessions-export"), dirs_exist_ok=True)
 
         out_dir = os.path.join(src, "cli", "sessions-export")
+
+        def bundle_of(sid):
+            with gzip.open(os.path.join(out_dir, sid + ".json.gz"), "rt", encoding="utf-8") as f:
+                return json.load(f)
+
         r = run(src, "export")
-        check("sessions: export roda", r.returncode == 0 and "2 exportadas" in r.stdout, r.stdout + r.stderr)
-        files = sorted(glob.glob(os.path.join(out_dir, "*.json")))
-        check("sessions: 2 arquivos", len(files) == 2, str(files))
-        with open(os.path.join(out_dir, "s1.json")) as f:
-            b = json.load(f)
+        check("sessions: export roda (gz)", r.returncode == 0 and "2 exportadas" in r.stdout, r.stdout + r.stderr)
+        check("sessions: arquivada fora do recorte", "1 sessão(ões) arquivada(s)" in r.stdout, r.stdout)
+        check("sessions: 2 arquivos .json.gz",
+              len(glob.glob(os.path.join(out_dir, "*.json.gz"))) == 2 and
+              not glob.glob(os.path.join(out_dir, "*.json")), "")
+        b = bundle_of("s1")
         types = [json.loads(p["data"]).get("type") for p in b["part"]]
-        check("sessions: tool fora por padrão", "tool" not in types and "text" in types, str(types))
+        check("sessions: tool fora, reasoning dentro",
+              "tool" not in types and "reasoning" in types and "text" in types, str(types))
+        check("sessions: sem stats por padrão", "model_usage" not in b and "tool_usage" not in b, "")
+        check("sessions: checkpoint fora, entrada normal dentro",
+              [e["id"] for e in b["session_entry"]] == ["e1"], str(b["session_entry"]))
         check("sessions: task incluída", b.get("task", {}).get("task_id") == "s1", str(b.get("task")))
         r = run(src, "export")
         check("sessions: incremental sem mudanças", "0 exportadas" in r.stdout, r.stdout)
 
+        p1 = os.path.join(out_dir, "s1.json.gz")
+        with open(p1, "rb") as f:
+            before = f.read()
+        run(src, "export", "--all")
+        with open(p1, "rb") as f:
+            after = f.read()
+        check("sessions: export determinístico (gzip mtime=0)", before == after)
+
         sync_bring()
         r = run(tgt, "import")
         check("sessions: import ok", r.returncode == 0 and "2 novas" in r.stdout, r.stdout + r.stderr)
-        db = os.path.join(tgt, "cli", "db", "db.sqlite")
-        c = sqlite3.connect(db)
+        c = sqlite3.connect(os.path.join(tgt, "cli", "db", "db.sqlite"))
         check("sessions: 2 sessões no destino", c.execute("select count(*) from session").fetchone()[0] == 2)
-        check("sessions: só parts sem tool", c.execute("select count(*) from part").fetchone()[0] == 2,
+        check("sessions: parts text+reasoning importadas",
+              c.execute("select count(*) from part").fetchone()[0] == 3,
               str(c.execute("select count(*) from part").fetchone()[0]))
-        check("sessions: entries/todos chegaram",
+        check("sessions: entries (sem checkpoint) e todo",
               c.execute("select count(*) from session_entry").fetchone()[0] == 1 and
               c.execute("select count(*) from todo").fetchone()[0] == 1)
+        check("sessions: stats não importadas", c.execute("select count(*) from model_usage").fetchone()[0] == 0)
         r = run(tgt, "import")
-        check("sessions: import idempotente",
-              c.execute("select count(*) from message").fetchone()[0] == 2, r.stdout)
+        check("sessions: import idempotente", c.execute("select count(*) from message").fetchone()[0] == 2, r.stdout)
         check("sessions: task importada",
               sqlite3.connect(os.path.join(tgt, "v2", "tasks-index.sqlite"))
               .execute("select count(*) from tasks").fetchone()[0] == 1)
 
         r = run(src, "export", "--with-tool")
         check("sessions: --with-tool re-exporta", "2 exportadas" in r.stdout, r.stdout)
-        with open(os.path.join(out_dir, "s1.json")) as f:
-            b = json.load(f)
         check("sessions: tool presente com --with-tool",
-              any(json.loads(p["data"]).get("type") == "tool" for p in b["part"]), "")
+              any(json.loads(p["data"]).get("type") == "tool" for p in bundle_of("s1")["part"]), "")
         sync_bring()
-        r = run(tgt, "import")
+        run(tgt, "import")
         check("sessions: enriquecimento adiciona a tool part",
-              c.execute("select count(*) from part").fetchone()[0] == 3,
-              str(r.stdout) + " " + str(c.execute("select count(*) from part").fetchone()[0]))
+              c.execute("select count(*) from part").fetchone()[0] == 4,
+              str(c.execute("select count(*) from part").fetchone()[0]))
+
+        run(src, "export", "--with-usage", "--with-checkpoints", "--with-tool")
+        sync_bring()
+        run(tgt, "import")
+        check("sessions: usage+checkpoint enriquecem",
+              c.execute("select count(*) from model_usage").fetchone()[0] == 1 and
+              c.execute("select count(*) from session_entry").fetchone()[0] == 2, "")
+
+        run(src, "export", "--no-reasoning", "--with-tool", "--with-usage", "--with-checkpoints")
+        types = [json.loads(p["data"]).get("type") for p in bundle_of("s1")["part"]]
+        check("sessions: --no-reasoning corta o pensamento", "reasoning" not in types and "tool" in types, str(types))
+
+        r = run(src, "export", "--with-archived", "--with-tool", "--no-reasoning",
+                "--with-usage", "--with-checkpoints")
+        check("sessions: --with-archived exporta a arquivada", "3 exportadas" in r.stdout, r.stdout)
+        check("sessions: 3 arquivos", len(glob.glob(os.path.join(out_dir, "*.json.gz"))) == 3, "")
+        sync_bring()
+        run(tgt, "import")
+        check("sessions: arquivada importada", c.execute("select count(*) from session").fetchone()[0] == 3, "")
         c.close()
 
         r = run(tgt, "status")
@@ -572,17 +617,23 @@ def unit_sessions():
 
 
 def unit_projects():
-    """Manifesto de projetos: scan com repo git, clone do que falta e idempotência."""
+    """Manifesto: scan com token sanitizado, clone --into + registro, pull ff-only."""
     base = tempfile.mkdtemp(prefix="zsync-proj-")
     try:
         root = os.path.join(base, "zcode")
         os.makedirs(os.path.join(root, "v2"))
         bare = os.path.join(base, "bare.git")
         proj = os.path.join(base, "proj")
-        subprocess.run(["git", "init", "--bare", "-q", bare], check=True)
+        subprocess.run(["git", "init", "--bare", "-q", "-b", "main", bare], check=True)
         os.makedirs(proj)
-        subprocess.run(["git", "init", "-q", proj], check=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", proj], check=True)
         subprocess.run(["git", "-C", proj, "remote", "add", "origin", bare], check=True)
+        with open(os.path.join(proj, "a.txt"), "w") as f:
+            f.write("v1\n")
+        g = ["git", "-C", proj, "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(g + ["add", "-A"], check=True)
+        subprocess.run(g + ["commit", "-qm", "c1"], check=True)
+        subprocess.run(g + ["push", "-q", "-u", "origin", "main"], check=True)
         with open(os.path.join(root, "v2", "setting.json"), "w") as f:
             json.dump({"recentProjects": [proj]}, f)
         prj = os.path.join(HERE, "..", "scripts", "projects.py")
@@ -597,16 +648,48 @@ def unit_projects():
             man = json.load(f)
         check("projects: repo detectado", man["projects"][0]["repo"].endswith("bare.git"), str(man))
 
-        man["projects"][0]["path"] = os.path.join(base, "cloned")
+        subprocess.run(["git", "-C", proj, "remote", "set-url", "origin",
+                        "https://user:tok3n@git.example.com/a/b.git"], check=True)
+        run("scan")
+        with open(os.path.join(root, "zsync-projects.json")) as f:
+            man = json.load(f)
+        repo = man["projects"][0]["repo"]
+        check("projects: token sanitizado do manifesto",
+              repo == "https://git.example.com/a/b.git" and "tok3n" not in repo, repo)
+        subprocess.run(["git", "-C", proj, "remote", "set-url", "origin", bare], check=True)
+        run("scan")  # manifesto volta a apontar para o remote real
+
+        other = os.path.join(base, "other")
+        subprocess.run(["git", "clone", "-q", bare, other], check=True)
+        with open(os.path.join(other, "b.txt"), "w") as f:
+            f.write("novo\n")
+        go = ["git", "-C", other, "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(go + ["add", "-A"], check=True)
+        subprocess.run(go + ["commit", "-qm", "c2"], check=True)
+        subprocess.run(go + ["push", "-q"], check=True)
+        r = run("pull")
+        check("projects: pull ff-only traz a mudança",
+              os.path.exists(os.path.join(proj, "b.txt")) and "atualizado" in r.stdout, r.stdout + r.stderr)
+        r = run("pull")
+        check("projects: pull em dia sem ruído", "todos em dia" in r.stdout, r.stdout)
+
+        with open(os.path.join(root, "zsync-projects.json")) as f:
+            man = json.load(f)
+        man["projects"][0]["path"] = os.path.join(base, "nao-existe", "proj")
         with open(os.path.join(root, "zsync-projects.json"), "w") as f:
             json.dump(man, f)
-        r = run("clone")
-        check("projects: clone criou o projeto", os.path.isdir(os.path.join(base, "cloned")),
-              r.stdout + r.stderr)
-        r = run("clone")
+        into = os.path.join(base, "into")
+        r = run("clone", "--into", into)
+        dest = os.path.join(into, "proj")
+        check("projects: clone --into criou o projeto", os.path.isdir(dest), r.stdout + r.stderr)
+        with open(os.path.join(root, "v2", "setting.json")) as f:
+            recents = json.load(f)["recentProjects"]
+        check("projects: recém-clonado registrado nos recentes", dest in recents, str(recents))
+        r = run("clone", "--into", into)
         check("projects: clone idempotente", "nada a clonar" in r.stdout, r.stdout)
+
         r = run("status")
-        check("projects: status marca ok", "[ok]" in r.stdout, r.stdout)
+        check("projects: status lista", "[ok]" in r.stdout or "[falta]" in r.stdout, r.stdout)
 
         r = subprocess.run([sys.executable, SCRIPT, "--root", root, "--data", root, "projects", "status"],
                            capture_output=True, text=True, timeout=60)

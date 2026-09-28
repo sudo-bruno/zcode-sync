@@ -1082,6 +1082,11 @@ def cmd_sync(ctx, args_json, args=None):
             pre = _sibling("sessions").export(ctx.root, ctx.data_dir)["lines"]
         except Exception as e:
             pre = ["aviso: export de sessões falhou: %r" % e]
+    if args is not None and getattr(args, "pull_projects", False):
+        try:
+            pre += _sibling("projects").pull(ctx.root)["lines"]
+        except Exception as e:
+            pre.append("aviso: pull de projetos falhou: %r" % e)
     lock = acquire_lock(ctx.data_dir)
     try:
         last_err = None
@@ -1151,6 +1156,14 @@ def cmd_status(ctx, args_json):
     try:
         for sline in _sibling("sessions").status(ctx.root, ctx.data_dir)["lines"]:
             lines.append(sline)
+    except Exception:
+        pass
+    try:
+        proj = _sibling("projects").load(ctx.root).get("projects") or []
+        if proj:
+            missing = sum(1 for p in proj if not os.path.isdir(p.get("path") or ""))
+            lines.append("projetos: %d no manifesto, %d ausente(s) aqui%s" % (
+                len(proj), missing, " — /zsync:projects clone" if missing else ""))
     except Exception:
         pass
     pending = ctx.conflicts()
@@ -1234,8 +1247,12 @@ def cmd_sessions(ctx, args_json, args):
     mod = _sibling("sessions")
     action = getattr(args, "action", "status")
     if action == "export":
-        r = mod.export(ctx.root, ctx.data_dir, with_tool=getattr(args, "with_tool", False),
-                       force_all=getattr(args, "all", False))
+        opts = {"with_tool": getattr(args, "with_tool", False),
+                "with_reasoning": not getattr(args, "no_reasoning", False),
+                "with_usage": getattr(args, "with_usage", False),
+                "with_checkpoints": getattr(args, "with_checkpoints", False),
+                "with_archived": getattr(args, "with_archived", False)}
+        r = mod.export(ctx.root, ctx.data_dir, opts=opts, force_all=getattr(args, "all", False))
     elif action == "import":
         r = mod.import_sessions(ctx.root, ctx.data_dir, backup=not getattr(args, "no_backup", False))
     else:
@@ -1250,7 +1267,9 @@ def cmd_projects(ctx, args_json, args):
     if action == "scan":
         r = mod.scan(ctx.root)
     elif action == "clone":
-        r = mod.clone(ctx.root)
+        r = mod.clone(ctx.root, into=getattr(args, "into", None))
+    elif action == "pull":
+        r = mod.pull(ctx.root)
     else:
         r = mod.status(ctx.root)
     return out(args_json, ok=r.get("ok", True), lines=r["lines"],
@@ -1276,15 +1295,22 @@ def main(argv):
     sync_p = sub.add_parser("sync")
     sync_p.add_argument("--export-sessions", action="store_true",
                         help="exporta sessões novas/alteradas antes de sincronizar")
+    sync_p.add_argument("--pull-projects", action="store_true",
+                        help="git pull --ff-only nos projetos existentes antes de sincronizar")
     sess_p = sub.add_parser("sessions")
     sess_p.add_argument("action", nargs="?", default="status", choices=["status", "export", "import"])
     sess_p.add_argument("--with-tool", action="store_true",
                         help="inclui parts de ferramenta (85%% do peso)")
+    sess_p.add_argument("--with-usage", action="store_true", help="inclui tabelas de estatísticas")
+    sess_p.add_argument("--with-checkpoints", action="store_true", help="inclui checkpoints")
+    sess_p.add_argument("--with-archived", action="store_true", help="inclui sessões arquivadas")
+    sess_p.add_argument("--no-reasoning", action="store_true", help="exclui o 'pensamento' do modelo")
     sess_p.add_argument("--all", action="store_true", help="re-exporta todas as sessões")
     sess_p.add_argument("--no-backup", action="store_true",
                         help="não faz backup do banco antes de importar")
     proj_p = sub.add_parser("projects")
-    proj_p.add_argument("action", nargs="?", default="status", choices=["status", "scan", "clone"])
+    proj_p.add_argument("action", nargs="?", default="status", choices=["status", "scan", "clone", "pull"])
+    proj_p.add_argument("--into", help="clona dentro deste diretório (remapeia caminhos)")
     sub.add_parser("conflicts")
     rp = sub.add_parser("resolve")
     rp.add_argument("--path", required=True)

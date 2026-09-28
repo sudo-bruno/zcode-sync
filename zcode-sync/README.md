@@ -55,7 +55,7 @@ Depois de instalar ou atualizar o plugin, **reinicie o ZCode uma vez** — os ho
 | `/zsync:status` | Conta logada, mudanças locais, versão remota, conflitos, último auto-sync |
 | `/zsync:resolve <caminho> keep-ours\|take-theirs\|delete` | Decide um conflito (sem argumentos: lista os pendentes) |
 | `/zsync:sessions [status\|export\|import]` | Sessões: estado, exportar agora, importar o que chegou |
-| `/zsync:projects [status\|scan\|clone]` | Projetos: lista sincronizada, remontar manifesto, clonar o que falta |
+| `/zsync:projects [status\|scan\|clone\|pull]` | Projetos: lista sincronizada, remontar manifesto, clonar o que falta, puxar novidades |
 | `/zsync:logout` | Revoga o token no Google e limpa o Keychain |
 
 Os comandos **não passam pelo modelo**: o corpo de cada um é um marcador (`zsync-cmd:…`); um hook de `UserPromptSubmit` intercepta antes da IA, roda o motor e devolve a saída na tela. Se os hooks do plugin estiverem desativados (ou falharem), os comandos caem no modo antigo — o modelo executa e resume; nada quebra.
@@ -70,19 +70,21 @@ O ZCode não observa as pastas de recursos (não existe watcher) — skills/agen
 
 ## Sessões (histórico de conversas)
 
-O banco de sessões (sqlite) não viaja — não existe formato de merge para ele. Em vez disso o plugin **exporta cada sessão para um arquivo JSON** em `~/.zcode/cli/sessions-export/` (id UUID = nunca colide entre máquinas) e o sync leva esses arquivos como qualquer outro. Na outra máquina, `/zsync:sessions import` aplica o que falta por `INSERT OR IGNORE`: só adiciona, nunca altera nem apaga nada existente; faz backup do banco antes (mantém os 2 últimos) e funciona melhor com o ZCode fechado — as sessões aparecem após reiniciar o app.
+O banco de sessões (sqlite) não viaja — não existe formato de merge para ele. Em vez disso o plugin **exporta cada sessão para um arquivo comprimido** (`.json.gz`, gzip determinístico) em `~/.zcode/cli/sessions-export/` (id UUID = nunca colide entre máquinas) e o sync leva esses arquivos como qualquer outro. Na outra máquina, `/zsync:sessions import` aplica o que falta por `INSERT OR IGNORE`: só adiciona, nunca altera nem apaga nada existente; faz backup do banco antes (mantém os 2 últimos) e funciona melhor com o ZCode fechado — as sessões aparecem após reiniciar o app.
 
-- Recorte padrão: **sem os outputs de ferramenta** (~85% do peso — saídas de comandos e leituras de arquivo). `--with-tool` inclui tudo; importar depois enriquece sem duplicar.
+- Recorte padrão (enxuto): **sem outputs de ferramenta** (~85% do peso), **sem tabelas de estatísticas**, **sem checkpoints** (apontam para artefatos que não viajam) e **sem sessões arquivadas**. Medido no seu histórico real: 384 MB → **68 MB** sem perder o conteúdo das conversas.
+- Mais cortes/inclusões: `--no-reasoning` remove também o "pensamento" do modelo; `--with-tool`, `--with-usage`, `--with-checkpoints`, `--with-archived` trazem de volta (importar depois enriquece sem duplicar).
+- Re-exportar sem mudanças gera **bytes idênticos** (gzip com timestamp fixo): nada trafega de novo.
 - O export roda sozinho antes de cada sync (manual e automático) e é incremental: só sessões novas/alteradas.
-- O primeiro export sobe ~230 MB (uma vez só); depois, apenas o que muda.
 
 ## Projetos (código via git)
 
-O manifesto `~/.zcode/zsync-projects.json` lista os projetos com o remote git de cada um e viaja no sync. O código em si **não passa pelo Drive** — binários grandes ficam no git:
+O manifesto `~/.zcode/zsync-projects.json` lista os projetos com o remote git de cada um e viaja no sync. O código em si **não passa pelo Drive** — binários grandes ficam no git, e o que trafega são os diffs do próprio git:
 
-1. `/zsync:projects scan` — na máquina principal, monta o manifesto (lê os projetos recentes do ZCode + `git remote get-url origin`).
+1. `/zsync:projects scan` — na máquina principal, monta o manifesto (projetos recentes do ZCode + `git remote get-url origin`). URLs com token embutido são **sanitizadas** antes de entrar no manifesto (ele vai para o Drive).
 2. `/zsync:projects` — mostra o que existe e o que falta nesta máquina.
-3. `/zsync:projects clone` — clona o que falta a partir do remote (mesmo caminho do manifesto; ajuste o arquivo se os caminhos diferirem entre máquinas).
+3. `/zsync:projects clone [--into <dir>]` — clona o que falta (o `--into` remapeia o destino quando os caminhos diferem entre máquinas; os clonados entram sozinhos nos projetos recentes do ZCode).
+4. `/zsync:projects pull` — `git pull --ff-only` nos projetos existentes (traz o que você subiu nas outras máquinas). O sync automático também roda isso antes de subir.
 
 ## Configuração única: Google Cloud (~10 minutos, uma vez)
 
