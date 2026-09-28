@@ -1,0 +1,13 @@
+{
+  "name": "dev-default-zsync",
+  "plugins": [
+    {
+      "name": "zcode-sync",
+      "source": "./zcode-sync",
+      "version": "0.1.2",
+      "description": "Sincroniza skills, agents, commands, AGENTS.md e memórias entre máquinas via Google Drive, com merge estilo git e resolução explícita de conflitos.",
+      "displayName": "ZCode Sync",
+      "category": "utilities"
+    }
+  ]
+}

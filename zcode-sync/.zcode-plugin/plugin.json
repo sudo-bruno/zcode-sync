@@ -1,0 +1,8 @@
+{
+  "name": "zcode-sync",
+  "version": "0.1.2",
+  "description": "Sincroniza skills, agents, commands, AGENTS.md e memórias do agente entre máquinas via Google Drive, com merge estilo git. Comandos /zsync:login, /zsync:sync, /zsync:status, /zsync:resolve, /zsync:logout.",
+  "author": { "name": "Bruno" },
+  "commands": "./commands",
+  "skills": "./skills"
+}

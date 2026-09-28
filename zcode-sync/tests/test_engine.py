@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+# Testes offline do zcode-sync: duas "máquinas" fake sobre backend de diretório.
+# Uso: python3 tests/test_engine.py   (a partir da raiz do plugin)
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCRIPT = os.path.join(HERE, "..", "scripts", "zsync.py")
+sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
+import zsync  # noqa: E402
+
+PASS = []
+FAIL = []
+
+
+def check(name, cond, detail=""):
+    if cond:
+        PASS.append(name)
+    else:
+        FAIL.append((name, detail))
+        print("FAIL: %s %s" % (name, detail))
+
+
+# ---------------------------------------------------------------------------
+# Unit: merge3
+# ---------------------------------------------------------------------------
+
+def unit_merge3():
+    b = ["a\n", "b\n", "c\n"]
+    m, c = zsync.merge3(b, ["A\n", "b\n", "c\n"], ["a\n", "b\n", "C\n"])
+    check("merge3: regiões distintas mesclam limpas", m == ["A\n", "b\n", "C\n"] and not c, repr(m))
+
+    m, c = zsync.merge3(b, ["A\n", "b\n", "c\n"], ["A\n", "b\n", "c\n"])
+    check("merge3: mesma mudança dos dois lados é limpa", m == ["A\n", "b\n", "c\n"] and not c, repr(m))
+
+    m, c = zsync.merge3(b, ["X\n", "b\n", "c\n"], ["Y\n", "b\n", "c\n"])
+    check("merge3: mesma região diferente conflita", c, repr(m))
+
+    m, c = zsync.merge3(["a\n", "b\n"], ["a\n", "X\n", "b\n"], ["A\n", "b\n"])
+    check("merge3: inserção na borda de mudança conflita (como git)", c, repr(m))
+
+    m, c = zsync.merge3(["a\n", "b\n", "c\n", "d\n"], ["a\n", "X\n", "b\n", "c\n", "d\n"],
+                        ["a\n", "b\n", "c\n", "d\n", "E\n"])
+    check("merge3: inserções em pontos distintos mesclam",
+          m == ["a\n", "X\n", "b\n", "c\n", "d\n", "E\n"] and not c, repr(m))
+
+    m, c = zsync.merge3([], ["nosso\n"], ["deles\n"])
+    check("merge3: add/add sem ancestral conflita", c, repr(m))
+
+    m, c = zsync.merge3([], ["igual\n"], ["igual\n"])
+    check("merge3: add/add idêntico é limpo", m == ["igual\n"] and not c, repr(m))
+
+    mb, c = zsync.merge3_bytes(b"x\x00\x01bin", b"nosso\x00bin", b"deles\x00bin")
+    check("merge3: binário não mescla, conflita", c and mb is None, repr(mb))
+
+    m, c = zsync.merge3(b, b, ["a\n", "b\n", "Z\n"])
+    check("merge3: só um lado mudou", m == ["a\n", "b\n", "Z\n"] and not c, repr(m))
+
+
+# ---------------------------------------------------------------------------
+# Integração: ciclo entre duas máquinas fake
+# ---------------------------------------------------------------------------
+
+class Lab:
+    def __init__(self):
+        self.base = tempfile.mkdtemp(prefix="zsync-test-")
+        self.backend = os.path.join(self.base, "backend")
+        os.makedirs(self.backend)
+        for m in ("m1", "m2"):
+            os.makedirs(os.path.join(self.base, m, ".zcode", "skills", "demo"))
+            os.makedirs(os.path.join(self.base, m, ".zcode", "agents"))
+            os.makedirs(os.path.join(self.base, m, ".zcode", "cli", "memories"))
+            os.makedirs(os.path.join(self.base, m, "data"))
+
+    def root(self, m):
+        return os.path.join(self.base, m, ".zcode")
+
+    def data(self, m):
+        return os.path.join(self.base, m, "data")
+
+    def path(self, m, rel):
+        return os.path.join(self.root(m), rel.replace("/", os.sep))
+
+    def write(self, m, rel, content):
+        p = self.path(m, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write(content)
+
+    def read(self, m, rel):
+        with open(self.path(m, rel)) as f:
+            return f.read()
+
+    def exists(self, m, rel):
+        return os.path.exists(self.path(m, rel))
+
+    def run(self, m, cmd, extra=None):
+        args = [sys.executable, SCRIPT, "--json",
+                "--root", self.root(m), "--data", self.data(m),
+                "--backend", "file:" + self.backend, "--device", m, cmd]
+        args += extra or []
+        r = subprocess.run(args, capture_output=True, text=True)
+        try:
+            return json.loads(r.stdout.strip().splitlines()[-1])
+        except Exception:
+            return {"ok": False, "lines": [r.stdout, r.stderr]}
+
+    def cleanup(self):
+        shutil.rmtree(self.base, ignore_errors=True)
+
+
+def integration():
+    lab = Lab()
+    try:
+        # t1 — primeira máquina sobe tudo
+        lab.write("m1", "skills/demo/SKILL.md", "# demo v1\n")
+        lab.write("m1", "agents/a.md", "l1\nl2\nl3\nl4\nl5\n")
+        lab.write("m1", "AGENTS.md", "# instruções\n")
+        lab.write("m1", "cli/memories/MEMORY.md", "- memória\n")
+        lab.write("m1", "skills/demo/.DS_Store", "junk")
+        r = lab.run("m1", "sync")
+        check("t1: primeiro push ok", r["ok"], str(r))
+        check("t1: 4 arquivos enviados", r["pushed"] and
+              sum(1 for e in r["events"] if e["type"] == "first-push") == 1, str(r["events"]))
+
+        # t2 — máquina 2 clona
+        r = lab.run("m2", "sync")
+        check("t2: clone ok", r["ok"], str(r))
+        check("t2: conteúdo baixado igual",
+              lab.read("m2", "agents/a.md") == "l1\nl2\nl3\nl4\nl5\n" and
+              lab.read("m2", "skills/demo/SKILL.md") == "# demo v1\n", "")
+        check("t2: .DS_Store não sincronizado", not lab.exists("m2", "skills/demo/.DS_Store"))
+
+        # t3 — divergência em arquivos diferentes
+        lab.write("m1", "agents/a.md", "M1\nl2\nl3\nl4\nl5\n")
+        lab.write("m2", "skills/demo/SKILL.md", "# demo v2-m2\n")
+        r = lab.run("m1", "sync")
+        check("t3: m1 empurra (fast path)", r["ok"] and r["pushed"], str(r))
+        r = lab.run("m2", "sync")
+        check("t3: m2 rebase+sobe", r["ok"] and r["pushed"], str(r))
+        r = lab.run("m1", "sync")
+        check("t3: m1 converge", r["ok"], str(r))
+        check("t3: ambos com as duas mudanças",
+              lab.read("m1", "skills/demo/SKILL.md") == "# demo v2-m2\n" and
+              lab.read("m2", "agents/a.md") == "M1\nl2\nl3\nl4\nl5\n", "")
+
+        # t4 — mesmo arquivo, regiões diferentes → merge limpo
+        lab.write("m1", "agents/a.md", "TOP1\nl2\nl3\nl4\nl5\n")
+        lab.write("m2", "agents/a.md", "M1\nl2\nl3\nl4\nBOT2\n")
+        lab.run("m1", "sync")
+        r = lab.run("m2", "sync")
+        check("t4: m2 mescla 3 vias", r["ok"] and
+              any(e["type"] == "mesclado" for e in r["events"]), str(r["events"]))
+        expected = "TOP1\nl2\nl3\nl4\nBOT2\n"
+        check("t4: m2 com as duas mudanças", lab.read("m2", "agents/a.md") == expected,
+              repr(lab.read("m2", "agents/a.md")))
+        r = lab.run("m1", "sync")
+        r1 = lab.read("m1", "agents/a.md")
+        r2 = lab.read("m2", "agents/a.md")
+        check("t4: máquinas convergem após merge", r1 == r2 == expected, "%r vs %r" % (r1, r2))
+
+        # t5 — mesma região → conflito, sem push
+        lab.write("m1", "AGENTS.md", "# instruções do M1\nregra local\n")
+        lab.write("m2", "AGENTS.md", "# instruções do M2\nregra local\n")
+        lab.run("m1", "sync")
+        r = lab.run("m2", "sync")
+        check("t5: conflito detectado", not r["pushed"] and
+              any(e["type"] == "conflito" for e in r["events"]), str(r["events"]))
+        import glob
+        copies = [os.path.basename(x) for x in glob.glob(lab.path("m2", "AGENTS.md.sync-conflict-*"))]
+        check("t5: cópia do lado deles criada", len(copies) == 1, str(copies))
+        check("t5: lado local preservado", lab.read("m2", "AGENTS.md") == "# instruções do M2\nregra local\n", "")
+        r = lab.run("m2", "status")
+        check("t5: status mostra conflito", r["ok"] and len(r["conflicts"]) == 1, str(r))
+
+        # t6 — resolve take-theirs converge
+        r = lab.run("m2", "resolve", ["--path", "AGENTS.md", "--choice", "take-theirs"])
+        check("t6: resolve ok", r["ok"], str(r))
+        check("t6: conteúdo deles aplicado", lab.read("m2", "AGENTS.md") == "# instruções do M1\nregra local\n", "")
+        r = lab.run("m2", "sync")
+        check("t6: push liberado", r["ok"] and r["pushed"], str(r))
+        lab.run("m1", "sync")
+        check("t6: m1 converge", lab.read("m1", "AGENTS.md") == "# instruções do M1\nregra local\n", "")
+
+        # t7 — deleção simples propaga
+        os.remove(lab.path("m1", "skills/demo/SKILL.md"))
+        r = lab.run("m1", "sync")
+        check("t7: deleção propagada do m1", r["ok"] and
+              any(e["type"] == "deletado-remoto" for e in r["events"]), str(r["events"]))
+        r = lab.run("m2", "sync")
+        check("t7: m2 aplicou a deleção", not lab.exists("m2", "skills/demo/SKILL.md") and r["ok"], str(r))
+
+        # t8 — modify/delete
+        lab.write("m1", "agents/a.md", "m1 apagou isso depois\n")
+        lab.run("m1", "sync")
+        os.remove(lab.path("m1", "agents/a.md"))
+        lab.run("m1", "sync")
+        lab.write("m2", "agents/a.md", lab.read("m2", "agents/a.md") + "edit m2\n")
+        r = lab.run("m2", "sync")
+        check("t8: modify/delete conflita e preserva local",
+              any(e["type"] == "conflito" for e in r["events"]) and lab.exists("m2", "agents/a.md"), str(r["events"]))
+        r = lab.run("m2", "resolve", ["--path", "agents/a.md", "--choice", "keep-ours"])
+        r = lab.run("m2", "sync")
+        check("t8: keep-ours ressuscita no remoto", r["ok"] and r["pushed"], str(r))
+        r = lab.run("m1", "sync")
+        check("t8: m1 recebe de volta", lab.exists("m1", "agents/a.md"), str(r))
+
+        # t9 — add/add
+        lab.write("m1", "commands/novo.md", "versão m1\n")
+        lab.write("m2", "commands/novo.md", "versão m2\n")
+        lab.run("m1", "sync")
+        r = lab.run("m2", "sync")
+        check("t9: add/add conflita", any(e["type"] == "conflito" for e in r["events"]) and
+              lab.read("m2", "commands/novo.md") == "versão m2\n", str(r["events"]))
+        r = lab.run("m2", "resolve", ["--path", "commands/novo.md", "--choice", "take-theirs"])
+        check("t9: resolve aplica m1", lab.read("m2", "commands/novo.md") == "versão m1\n", str(r))
+
+        # t10 — binário conflita sem mesclar
+        os.makedirs(lab.path("m1", "skills/demo"), exist_ok=True)
+        os.makedirs(lab.path("m2", "skills/demo"), exist_ok=True)
+        with open(lab.path("m1", "skills/demo/logo.bin"), "wb") as f:
+            f.write(b"\x00\x01m1")
+        with open(lab.path("m2", "skills/demo/logo.bin"), "wb") as f:
+            f.write(b"\x00\x01m2")
+        lab.run("m1", "sync")
+        r = lab.run("m2", "sync")
+        check("t10: binário vira conflito", any(e["type"] == "conflito" for e in r["events"]), str(r["events"]))
+
+        # t11 — estado final: sem conflitos não resolvidos além dos esperados
+        r = lab.run("m1", "status")
+        check("t11: status final m1 ok", r["ok"], str(r))
+    finally:
+        lab.cleanup()
+
+
+def main():
+    unit_merge3()
+    integration()
+    print("")
+    print("PASS: %d  FAIL: %d" % (len(PASS), len(FAIL)))
+    if FAIL:
+        for name, detail in FAIL:
+            print("  - %s %s" % (name, detail))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
