@@ -12,11 +12,13 @@ Plugin ZCode que sincroniza seus recursos entre máquinas usando o Google Drive 
 | Sincroniza | Nunca toca |
 |---|---|
 | `~/.zcode/skills/` | `~/.zcode/cli/config.json` (hooks/MCP da máquina) |
-| `~/.zcode/agents/` | `~/.zcode/cli/db` (sessões) |
+| `~/.zcode/agents/` | `~/.zcode/cli/db` (o banco não viaja; sessões vão por `cli/sessions-export/`) |
 | `~/.zcode/commands/` | `~/.zcode/v2/credentials.json` (sessão de login) |
-| `~/.zcode/AGENTS.md` | `~/.zcode/v2/setting.json` (projetos/UI, por máquina) |
+| `~/.zcode/AGENTS.md` | `~/.zcode/v2/setting.json` (UI, por máquina) |
 | `~/.zcode/cli/memories/` | `~/.zcode/workspace/` e cache de plugins |
 | `~/.zcode/v2/config.json` + `v2/provider_config.json` (providers e chaves de API) | |
+| `~/.zcode/cli/sessions-export/` (sessões em JSON — ver abaixo) | |
+| `~/.zcode/zsync-projects.json` (manifesto de projetos) | |
 
 Arquivos de config recebem **backup automático** antes de qualquer sobrescrita ou deleção (`config.json.zsync-backup-<data>`, mantidos os 5 últimos por arquivo, permissão 0600). Os backups ficam só na máquina e nunca entram no sync. `v2/credentials.json` (token de login da conta) fica de fora de propósito: sincronizar sessão de login pode derrubar o login de uma das máquinas na rotação de tokens — cada máquina loga uma vez, como sempre.
 
@@ -52,6 +54,8 @@ Depois de instalar ou atualizar o plugin, **reinicie o ZCode uma vez** — os ho
 | `/zsync:sync` | Sincroniza agora e mostra o relatório |
 | `/zsync:status` | Conta logada, mudanças locais, versão remota, conflitos, último auto-sync |
 | `/zsync:resolve <caminho> keep-ours\|take-theirs\|delete` | Decide um conflito (sem argumentos: lista os pendentes) |
+| `/zsync:sessions [status\|export\|import]` | Sessões: estado, exportar agora, importar o que chegou |
+| `/zsync:projects [status\|scan\|clone]` | Projetos: lista sincronizada, remontar manifesto, clonar o que falta |
 | `/zsync:logout` | Revoga o token no Google e limpa o Keychain |
 
 Os comandos **não passam pelo modelo**: o corpo de cada um é um marcador (`zsync-cmd:…`); um hook de `UserPromptSubmit` intercepta antes da IA, roda o motor e devolve a saída na tela. Se os hooks do plugin estiverem desativados (ou falharem), os comandos caem no modo antigo — o modelo executa e resume; nada quebra.
@@ -63,6 +67,22 @@ O ZCode não observa as pastas de recursos (não existe watcher) — skills/agen
 ## Desligar o automático
 
 **Settings → Plugin Management → zcode-sync**: desative os hooks do plugin. Consequência: sem sync automático e os comandos `/zsync:*` voltam ao modo modelo (fallback embutido). Os comandos manuais continuam existindo.
+
+## Sessões (histórico de conversas)
+
+O banco de sessões (sqlite) não viaja — não existe formato de merge para ele. Em vez disso o plugin **exporta cada sessão para um arquivo JSON** em `~/.zcode/cli/sessions-export/` (id UUID = nunca colide entre máquinas) e o sync leva esses arquivos como qualquer outro. Na outra máquina, `/zsync:sessions import` aplica o que falta por `INSERT OR IGNORE`: só adiciona, nunca altera nem apaga nada existente; faz backup do banco antes (mantém os 2 últimos) e funciona melhor com o ZCode fechado — as sessões aparecem após reiniciar o app.
+
+- Recorte padrão: **sem os outputs de ferramenta** (~85% do peso — saídas de comandos e leituras de arquivo). `--with-tool` inclui tudo; importar depois enriquece sem duplicar.
+- O export roda sozinho antes de cada sync (manual e automático) e é incremental: só sessões novas/alteradas.
+- O primeiro export sobe ~230 MB (uma vez só); depois, apenas o que muda.
+
+## Projetos (código via git)
+
+O manifesto `~/.zcode/zsync-projects.json` lista os projetos com o remote git de cada um e viaja no sync. O código em si **não passa pelo Drive** — binários grandes ficam no git:
+
+1. `/zsync:projects scan` — na máquina principal, monta o manifesto (lê os projetos recentes do ZCode + `git remote get-url origin`).
+2. `/zsync:projects` — mostra o que existe e o que falta nesta máquina.
+3. `/zsync:projects clone` — clona o que falta a partir do remote (mesmo caminho do manifesto; ajuste o arquivo se os caminhos diferirem entre máquinas).
 
 ## Configuração única: Google Cloud (~10 minutos, uma vez)
 
@@ -91,6 +111,7 @@ Na primeira tela de login o Google mostra o aviso "app não verificado" — norm
 - Todas as chamadas vão por HTTPS para `accounts.google.com`, `oauth2.googleapis.com` e `www.googleapis.com`.
 - Whitelist com verificação de caminho: nada fora das pastas listadas é lido ou gravado.
 - **Chaves de API dos providers viajam pelo seu Drive privado** (decisão sua, como no backup do WhatsApp). Os backups locais de config ficam com permissão 0600.
+- **Os arquivos de sessão contêm o texto das conversas** (sem outputs de ferramenta por padrão) e viajam pelo mesmo Drive privado — o export local também fica 0600.
 - O `client_secret` de um OAuth client tipo Desktop não é tratado como confidencial pelo Google (apps instalados não conseguem guardar segredos — por isso apps como o WhatsApp embutem o próprio). Ainda assim, mantenha este repositório privado; o GitHub Push Protection pode bloquear o primeiro push por causa dele — use os links de "unblock" que o próprio GitHub oferece.
 
 ## Problemas conhecidos

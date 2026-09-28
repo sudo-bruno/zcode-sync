@@ -1,6 +1,6 @@
 ---
 name: zsync
-description: "Sincronização de recursos do ZCode entre máquinas (skills, agents, commands, AGENTS.md, memórias) via Google Drive, com merge estilo git. Use quando o usuário pedir para sincronizar máquinas, verificar estado do sync, resolver conflitos de sincronização, conectar/desconectar a conta Google do zcode-sync, ou perguntar como o sync funciona. Comandos rápidos — /zsync:login, /zsync:sync, /zsync:status, /zsync:resolve, /zsync:logout."
+description: "Sincronização de recursos do ZCode entre máquinas (skills, agents, commands, AGENTS.md, memórias, configs de providers, sessões e projetos) via Google Drive, com merge estilo git. Use quando o usuário pedir para sincronizar máquinas, verificar estado do sync, resolver conflitos de sincronização, conectar/desconectar a conta Google do zcode-sync, exportar/importar sessões ou trabalhar com a lista de projetos — /zsync:login, /zsync:sync, /zsync:status, /zsync:resolve, /zsync:sessions, /zsync:projects, /zsync:logout."
 ---
 
 # zsync — sync do ~/.zcode entre máquinas
@@ -11,7 +11,7 @@ Sempre execute a ação através do script do plugin, nunca editando arquivos de
 python3 "<base da skill>/../scripts/zsync.py" --json <comando>
 ```
 
-Comandos: `login`, `logout`, `status`, `sync`, `conflicts`, `resolve --path <p> --choice keep-ours|take-theirs|delete`.
+Comandos: `login`, `logout`, `status`, `sync`, `sessions [status|export|import]`, `projects [status|scan|clone]`, `conflicts`, `resolve --path <p> --choice keep-ours|take-theirs|delete`.
 
 ## Como o sync funciona (para explicar ao usuário)
 

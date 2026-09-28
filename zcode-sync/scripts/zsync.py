@@ -42,8 +42,9 @@ SCOPES = "openid email https://www.googleapis.com/auth/drive.appdata"
 
 # Whitelist fechada: só isto sincroniza. Nada de cli/config.json, cli/db, v2/credentials.json, workspace/.
 SYNC_ROOTS = ["skills", "agents", "commands", "AGENTS.md", os.path.join("cli", "memories"),
-              "v2/config.json", "v2/provider_config.json"]
-SINGLE_FILES = {"AGENTS.md", "v2/config.json", "v2/provider_config.json"}
+              "v2/config.json", "v2/provider_config.json",
+              os.path.join("cli", "sessions-export"), "zsync-projects.json"]
+SINGLE_FILES = {"AGENTS.md", "v2/config.json", "v2/provider_config.json", "zsync-projects.json"}
 # Arquivos de config (contêm chaves de API): backup local antes de sobrescrever ou deletar.
 PROTECTED_FILES = {"v2/config.json", "v2/provider_config.json"}
 
@@ -1064,7 +1065,23 @@ def write_conflict_copy(ctx, p, theirs_data, rsha, remote, existing_cp):
     return copy_name
 
 
-def cmd_sync(ctx, args_json):
+def _sibling(name):
+    """Carrega um módulo vizinho deste script (sessions.py, projects.py)."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name + ".py")
+    spec = importlib.util.spec_from_file_location("zsync_" + name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def cmd_sync(ctx, args_json, args=None):
+    pre = []
+    if args is not None and getattr(args, "export_sessions", False):
+        try:
+            pre = _sibling("sessions").export(ctx.root, ctx.data_dir)["lines"]
+        except Exception as e:
+            pre = ["aviso: export de sessões falhou: %r" % e]
     lock = acquire_lock(ctx.data_dir)
     try:
         last_err = None
@@ -1073,6 +1090,8 @@ def cmd_sync(ctx, args_json):
                 report, pushed = run_sync(ctx)
                 lines = ["Sincronização concluída (%s)." % ctx.device]
                 lines += report.summary_lines(compact=ctx.compact)
+                if pre:
+                    lines = pre + [""] + lines
                 if not report.events:
                     lines.append("Nada a fazer: máquina já em dia com o remoto.")
                 return out(args_json, ok=True, lines=lines,
@@ -1129,6 +1148,11 @@ def cmd_status(ctx, args_json):
         lines.append("  modificados: %s" % ", ".join(modified[:10]) + (" …" if len(modified) > 10 else ""))
     if deleted:
         lines.append("  deletados: %s" % ", ".join(deleted[:10]) + (" …" if len(deleted) > 10 else ""))
+    try:
+        for sline in _sibling("sessions").status(ctx.root, ctx.data_dir)["lines"]:
+            lines.append(sline)
+    except Exception:
+        pass
     pending = ctx.conflicts()
     if pending:
         lines.append("conflitos pendentes (%d):" % len(pending))
@@ -1206,6 +1230,33 @@ def cmd_resolve(ctx, args_json, path, choice):
                                           "Rode /zsync:sync para propagar."], resolved=path, choice=choice)
 
 
+def cmd_sessions(ctx, args_json, args):
+    mod = _sibling("sessions")
+    action = getattr(args, "action", "status")
+    if action == "export":
+        r = mod.export(ctx.root, ctx.data_dir, with_tool=getattr(args, "with_tool", False),
+                       force_all=getattr(args, "all", False))
+    elif action == "import":
+        r = mod.import_sessions(ctx.root, ctx.data_dir, backup=not getattr(args, "no_backup", False))
+    else:
+        r = mod.status(ctx.root, ctx.data_dir)
+    return out(args_json, ok=r.get("ok", True), lines=r["lines"],
+               **{k: v for k, v in r.items() if k not in ("ok", "lines")})
+
+
+def cmd_projects(ctx, args_json, args):
+    mod = _sibling("projects")
+    action = getattr(args, "action", "status")
+    if action == "scan":
+        r = mod.scan(ctx.root)
+    elif action == "clone":
+        r = mod.clone(ctx.root)
+    else:
+        r = mod.status(ctx.root)
+    return out(args_json, ok=r.get("ok", True), lines=r["lines"],
+               **{k: v for k, v in r.items() if k not in ("ok", "lines")})
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -1222,7 +1273,18 @@ def main(argv):
     sub.add_parser("login")
     sub.add_parser("logout")
     sub.add_parser("status")
-    sub.add_parser("sync")
+    sync_p = sub.add_parser("sync")
+    sync_p.add_argument("--export-sessions", action="store_true",
+                        help="exporta sessões novas/alteradas antes de sincronizar")
+    sess_p = sub.add_parser("sessions")
+    sess_p.add_argument("action", nargs="?", default="status", choices=["status", "export", "import"])
+    sess_p.add_argument("--with-tool", action="store_true",
+                        help="inclui parts de ferramenta (85%% do peso)")
+    sess_p.add_argument("--all", action="store_true", help="re-exporta todas as sessões")
+    sess_p.add_argument("--no-backup", action="store_true",
+                        help="não faz backup do banco antes de importar")
+    proj_p = sub.add_parser("projects")
+    proj_p.add_argument("action", nargs="?", default="status", choices=["status", "scan", "clone"])
     sub.add_parser("conflicts")
     rp = sub.add_parser("resolve")
     rp.add_argument("--path", required=True)
@@ -1239,7 +1301,11 @@ def main(argv):
         if args.cmd == "status":
             return cmd_status(ctx, args.json)
         if args.cmd == "sync":
-            return cmd_sync(ctx, args.json)
+            return cmd_sync(ctx, args.json, args)
+        if args.cmd == "sessions":
+            return cmd_sessions(ctx, args.json, args)
+        if args.cmd == "projects":
+            return cmd_projects(ctx, args.json, args)
         if args.cmd == "conflicts":
             return cmd_conflicts(ctx, args.json)
         if args.cmd == "resolve":

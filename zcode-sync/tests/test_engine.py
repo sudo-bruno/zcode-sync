@@ -2,9 +2,11 @@
 # Testes offline do zcode-sync: duas "máquinas" fake sobre backend de diretório.
 # Uso: python3 tests/test_engine.py   (a partir da raiz do plugin)
 
+import glob
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -374,12 +376,253 @@ def unit_lock():
         shutil.rmtree(base, ignore_errors=True)
 
 
+SESSIONS_DDL = """
+CREATE TABLE session (
+    id text primary key, project_id text not null, workspace_id text, parent_id text,
+    slug text not null, directory text not null, path text, title text not null,
+    version text not null, share_url text, summary_additions integer, summary_deletions integer,
+    summary_files integer, summary_diffs text, revert text, permission text,
+    time_created integer not null, time_updated integer not null, time_compacting integer,
+    time_archived integer, task_type text not null default 'interactive',
+    title_source text not null default 'first_input',
+    title_message_id text, time_title_updated integer, trace_id text
+);
+CREATE TABLE message (
+    id text primary key, session_id text not null references session(id) on delete cascade,
+    time_created integer not null, time_updated integer not null, data text not null, sequence integer
+);
+CREATE TABLE part (
+    id text primary key, message_id text not null references message(id) on delete cascade,
+    session_id text not null, time_created integer not null, time_updated integer not null,
+    data text not null, sequence integer
+);
+CREATE TABLE session_entry (
+    id text primary key, session_id text not null references session(id) on delete cascade,
+    type text not null, time_created integer not null, time_updated integer not null, data text not null
+);
+CREATE TABLE todo (
+    session_id text not null references session(id) on delete cascade,
+    content text not null, status text not null, priority text not null, position integer not null,
+    time_created integer not null, time_updated integer not null, primary key(session_id, position)
+);
+CREATE TABLE model_usage (
+    id text primary key, logical_request_id text not null, attempt_index integer not null default 0,
+    session_id text not null references session(id) on delete cascade, turn_id text, trace_id text,
+    span_id text, assistant_message_id text, parent_user_message_id text, query_source text not null,
+    provider_id text not null, model_id text not null, variant text, agent text, mode text,
+    task_type text, status text not null, started_at integer not null, first_token_at integer,
+    completed_at integer, duration_ms integer, time_to_first_token_ms integer, finish_reason text,
+    tool_call_count integer not null default 0, input_tokens integer not null default 0,
+    output_tokens integer not null default 0, reasoning_tokens integer not null default 0,
+    cache_creation_input_tokens integer not null default 0, cache_read_input_tokens integer not null default 0,
+    provider_total_tokens integer, computed_total_tokens integer not null default 0,
+    retry_count integer not null default 0, retryable integer not null default 0,
+    cancelled_by_user integer not null default 0, context_exceeded integer not null default 0,
+    error_type text, error_code text, error_message text, raw_usage_json text, provider_metadata_json text
+);
+CREATE TABLE tool_usage (
+    id text primary key, session_id text not null references session(id) on delete cascade,
+    turn_id text, trace_id text, tool_call_id text not null, tool_name text not null,
+    side_effect_scope text, read_only integer, destructive integer, approval_status text,
+    status text not null, started_at integer not null, first_output_at integer, completed_at integer,
+    duration_ms integer, time_to_first_output_ms integer, exit_code integer,
+    output_bytes integer not null default 0, stdout_bytes integer not null default 0,
+    stderr_bytes integer not null default 0, truncated integer not null default 0,
+    retry_count integer not null default 0, retryable integer not null default 0,
+    cancelled_by_user integer not null default 0, error_type text, error_code text, error_message text
+);
+"""
+
+TASKS_DDL = """
+CREATE TABLE tasks (
+    workspace_key TEXT NOT NULL, workspace_path TEXT NOT NULL, workspace_identity TEXT,
+    task_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', task_status TEXT, provider TEXT,
+    mode TEXT NOT NULL DEFAULT 'build', model TEXT, migration_source TEXT, forked_from_task_id TEXT,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, unread_at INTEGER,
+    last_unread_at INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0, deleted INTEGER NOT NULL DEFAULT 0,
+    title_overridden INTEGER NOT NULL DEFAULT 0, meta_json TEXT NOT NULL DEFAULT '{}',
+    searchable_text TEXT NOT NULL DEFAULT '', cron_automation_id TEXT, off_peak_task_id TEXT,
+    PRIMARY KEY (workspace_key, task_id)
+);
+"""
+
+
+def _mk_sessions_pair(root, with_task=False):
+    """Cria db.sqlite + tasks-index.sqlite mínimos mas fiéis ao schema real."""
+    os.makedirs(os.path.join(root, "cli", "db"), exist_ok=True)
+    os.makedirs(os.path.join(root, "v2"), exist_ok=True)
+    c = sqlite3.connect(os.path.join(root, "cli", "db", "db.sqlite"))
+    c.executescript(SESSIONS_DDL)
+    t0, t1 = 1000, 2000
+    c.execute("insert into session (id, project_id, slug, directory, title, version, time_created, time_updated)"
+              " values ('s1','p1','slug1','/tmp/x','S1','3.14.3',?,?)", (t0, t1))
+    c.execute("insert into session (id, project_id, slug, directory, title, version, time_created, time_updated)"
+              " values ('s2','p1','slug2','/tmp/x','S2','3.14.3',?,?)", (t0, t1))
+    c.execute("insert into message (id, session_id, time_created, time_updated, data) values ('m1','s1',?,?,'{\"role\":\"user\"}')", (t0, t0))
+    c.execute("insert into message (id, session_id, time_created, time_updated, data) values ('m2','s2',?,?,'{\"role\":\"user\"}')", (t0, t0))
+    c.execute("insert into part (id, message_id, session_id, time_created, time_updated, data)"
+              " values ('p1','m1','s1',?,?,'{\"type\":\"text\",\"text\":\"oi\"}')", (t0, t0))
+    c.execute("insert into part (id, message_id, session_id, time_created, time_updated, data)"
+              " values ('p2','m1','s1',?,?,'{\"type\":\"tool\",\"tool\":\"bash\"}')", (t0, t0))
+    c.execute("insert into part (id, message_id, session_id, time_created, time_updated, data)"
+              " values ('p3','m2','s2',?,?,'{\"type\":\"text\",\"text\":\"ola\"}')", (t0, t0))
+    c.execute("insert into session_entry (id, session_id, type, time_created, time_updated, data)"
+              " values ('e1','s1','v4/model',?,?,'{}')", (t0, t0))
+    c.execute("insert into todo (session_id, content, status, priority, position, time_created, time_updated)"
+              " values ('s1','fazer','pending','high',0,?,?)", (t0, t0))
+    c.commit()
+    c.close()
+    tc = sqlite3.connect(os.path.join(root, "v2", "tasks-index.sqlite"))
+    tc.executescript(TASKS_DDL)
+    if with_task:
+        tc.execute("insert into tasks (workspace_key, workspace_path, task_id, title, created_at, updated_at)"
+                   " values ('wk','/tmp/x','s1','S1',?,?)", (t0, t1))
+    tc.commit()
+    tc.close()
+
+
+def _mk_empty_pair(root):
+    """Máquina 'nova': só o schema, sem dados."""
+    os.makedirs(os.path.join(root, "cli", "db"), exist_ok=True)
+    os.makedirs(os.path.join(root, "v2"), exist_ok=True)
+    c = sqlite3.connect(os.path.join(root, "cli", "db", "db.sqlite"))
+    c.executescript(SESSIONS_DDL)
+    c.commit()
+    c.close()
+    tc = sqlite3.connect(os.path.join(root, "v2", "tasks-index.sqlite"))
+    tc.executescript(TASKS_DDL)
+    tc.commit()
+    tc.close()
+
+
+def unit_sessions():
+    """Export/import de sessões: recorte, incremental, idempotência e enriquecimento."""
+    base = tempfile.mkdtemp(prefix="zsync-sess-")
+    try:
+        src, tgt = os.path.join(base, "src"), os.path.join(base, "tgt")
+        _mk_sessions_pair(src, with_task=True)
+        _mk_empty_pair(tgt)
+        sess = os.path.join(HERE, "..", "scripts", "sessions.py")
+        data = os.path.join(base, "data")
+        os.makedirs(data)
+
+        def run(root, *a):
+            return subprocess.run([sys.executable, sess, "--root", root, "--data", data] + list(a),
+                                  capture_output=True, text=True, timeout=60)
+
+        def sync_bring():
+            """Simula o sync levando os arquivos exportados de src para tgt."""
+            shutil.copytree(os.path.join(src, "cli", "sessions-export"),
+                            os.path.join(tgt, "cli", "sessions-export"), dirs_exist_ok=True)
+
+        out_dir = os.path.join(src, "cli", "sessions-export")
+        r = run(src, "export")
+        check("sessions: export roda", r.returncode == 0 and "2 exportadas" in r.stdout, r.stdout + r.stderr)
+        files = sorted(glob.glob(os.path.join(out_dir, "*.json")))
+        check("sessions: 2 arquivos", len(files) == 2, str(files))
+        with open(os.path.join(out_dir, "s1.json")) as f:
+            b = json.load(f)
+        types = [json.loads(p["data"]).get("type") for p in b["part"]]
+        check("sessions: tool fora por padrão", "tool" not in types and "text" in types, str(types))
+        check("sessions: task incluída", b.get("task", {}).get("task_id") == "s1", str(b.get("task")))
+        r = run(src, "export")
+        check("sessions: incremental sem mudanças", "0 exportadas" in r.stdout, r.stdout)
+
+        sync_bring()
+        r = run(tgt, "import")
+        check("sessions: import ok", r.returncode == 0 and "2 novas" in r.stdout, r.stdout + r.stderr)
+        db = os.path.join(tgt, "cli", "db", "db.sqlite")
+        c = sqlite3.connect(db)
+        check("sessions: 2 sessões no destino", c.execute("select count(*) from session").fetchone()[0] == 2)
+        check("sessions: só parts sem tool", c.execute("select count(*) from part").fetchone()[0] == 2,
+              str(c.execute("select count(*) from part").fetchone()[0]))
+        check("sessions: entries/todos chegaram",
+              c.execute("select count(*) from session_entry").fetchone()[0] == 1 and
+              c.execute("select count(*) from todo").fetchone()[0] == 1)
+        r = run(tgt, "import")
+        check("sessions: import idempotente",
+              c.execute("select count(*) from message").fetchone()[0] == 2, r.stdout)
+        check("sessions: task importada",
+              sqlite3.connect(os.path.join(tgt, "v2", "tasks-index.sqlite"))
+              .execute("select count(*) from tasks").fetchone()[0] == 1)
+
+        r = run(src, "export", "--with-tool")
+        check("sessions: --with-tool re-exporta", "2 exportadas" in r.stdout, r.stdout)
+        with open(os.path.join(out_dir, "s1.json")) as f:
+            b = json.load(f)
+        check("sessions: tool presente com --with-tool",
+              any(json.loads(p["data"]).get("type") == "tool" for p in b["part"]), "")
+        sync_bring()
+        r = run(tgt, "import")
+        check("sessions: enriquecimento adiciona a tool part",
+              c.execute("select count(*) from part").fetchone()[0] == 3,
+              str(r.stdout) + " " + str(c.execute("select count(*) from part").fetchone()[0]))
+        c.close()
+
+        r = run(tgt, "status")
+        check("sessions: status ok", r.returncode == 0 and "exportadas" in r.stdout, r.stdout)
+
+        r = subprocess.run([sys.executable, SCRIPT, "--root", src, "--data", data, "sessions", "status"],
+                           capture_output=True, text=True, timeout=60)
+        check("wiring: zsync.py sessions status", r.returncode == 0 and "sessões" in r.stdout,
+              r.stdout + r.stderr)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def unit_projects():
+    """Manifesto de projetos: scan com repo git, clone do que falta e idempotência."""
+    base = tempfile.mkdtemp(prefix="zsync-proj-")
+    try:
+        root = os.path.join(base, "zcode")
+        os.makedirs(os.path.join(root, "v2"))
+        bare = os.path.join(base, "bare.git")
+        proj = os.path.join(base, "proj")
+        subprocess.run(["git", "init", "--bare", "-q", bare], check=True)
+        os.makedirs(proj)
+        subprocess.run(["git", "init", "-q", proj], check=True)
+        subprocess.run(["git", "-C", proj, "remote", "add", "origin", bare], check=True)
+        with open(os.path.join(root, "v2", "setting.json"), "w") as f:
+            json.dump({"recentProjects": [proj]}, f)
+        prj = os.path.join(HERE, "..", "scripts", "projects.py")
+
+        def run(*a):
+            return subprocess.run([sys.executable, prj, "--root", root] + list(a),
+                                  capture_output=True, text=True, timeout=120)
+
+        r = run("scan")
+        check("projects: scan ok", r.returncode == 0 and "1 projeto" in r.stdout, r.stdout + r.stderr)
+        with open(os.path.join(root, "zsync-projects.json")) as f:
+            man = json.load(f)
+        check("projects: repo detectado", man["projects"][0]["repo"].endswith("bare.git"), str(man))
+
+        man["projects"][0]["path"] = os.path.join(base, "cloned")
+        with open(os.path.join(root, "zsync-projects.json"), "w") as f:
+            json.dump(man, f)
+        r = run("clone")
+        check("projects: clone criou o projeto", os.path.isdir(os.path.join(base, "cloned")),
+              r.stdout + r.stderr)
+        r = run("clone")
+        check("projects: clone idempotente", "nada a clonar" in r.stdout, r.stdout)
+        r = run("status")
+        check("projects: status marca ok", "[ok]" in r.stdout, r.stdout)
+
+        r = subprocess.run([sys.executable, SCRIPT, "--root", root, "--data", root, "projects", "status"],
+                           capture_output=True, text=True, timeout=60)
+        check("wiring: zsync.py projects status", r.returncode == 0, r.stdout + r.stderr)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
 def main():
     unit_merge3()
     unit_auth_fallback()
     unit_auto_sync()
     unit_prompt_hook()
     unit_lock()
+    unit_sessions()
+    unit_projects()
     integration()
     print("")
     print("PASS: %d  FAIL: %d" % (len(PASS), len(FAIL)))
