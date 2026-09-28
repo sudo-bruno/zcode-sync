@@ -890,6 +890,11 @@ def run_sync(ctx):
             ensure_blob(ctx, backend, p, lentry)
             new_files[p] = lentry
             report.add("enviado", p)
+        if not report.events and new_files == remote.get("files", {}):
+            # nada mudou dos dois lados: só realinhar o estado (sem push desnecessário)
+            ctx.save_state(remote["version"], {p: e["sha256"] for p, e in new_files.items()})
+            ctx.save_conflicts(pending)
+            return report, False
         version = remote["version"] + 1
         manifest = {"version": version, "updated": now_iso(), "device": ctx.device, "files": new_files}
         verify_and_put_manifest(ctx, backend, remote["version"], manifest)

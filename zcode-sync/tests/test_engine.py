@@ -178,14 +178,14 @@ def integration():
         r = lab.run("m2", "status")
         check("t5: status mostra conflito", r["ok"] and len(r["conflicts"]) == 1, str(r))
 
-        # t6 — resolve take-theirs converge
+        # t6 — resolve take-theirs converge (remoto já tem o lado deles → sem push necessário)
         r = lab.run("m2", "resolve", ["--path", "AGENTS.md", "--choice", "take-theirs"])
         check("t6: resolve ok", r["ok"], str(r))
         check("t6: conteúdo deles aplicado", lab.read("m2", "AGENTS.md") == "# instruções do M1\nregra local\n", "")
         r = lab.run("m2", "sync")
-        check("t6: push liberado", r["ok"] and r["pushed"], str(r))
-        lab.run("m1", "sync")
-        check("t6: m1 converge", lab.read("m1", "AGENTS.md") == "# instruções do M1\nregra local\n", "")
+        check("t6: sync sem push (remoto já é o lado deles)", r["ok"] and not r["pushed"], str(r))
+        r = lab.run("m1", "sync")
+        check("t6: m1 converge", lab.read("m1", "AGENTS.md") == "# instruções do M1\nregra local\n", str(r))
 
         # t7 — deleção simples propaga
         os.remove(lab.path("m1", "skills/demo/SKILL.md"))
