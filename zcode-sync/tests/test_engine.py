@@ -238,8 +238,53 @@ def integration():
         lab.cleanup()
 
 
+def unit_auth_fallback():
+    """Sem binário `security` (Linux): save() cai pro arquivo 0600 e creds voltam."""
+    base = tempfile.mkdtemp(prefix="zsync-auth-")
+    try:
+        orig_run = zsync._run_tool
+        zsync._run_tool = lambda *a, **k: None  # simula ausência do keychain
+        auth = zsync.Auth(base)
+        auth.save("refresh-token-x", "eu@teste")
+        fallback = os.path.join(base, "auth.json")
+        check("auth: fallback arquivo criado", os.path.exists(fallback))
+        check("auth: fallback legível", auth.creds().get("refresh_token") == "refresh-token-x")
+        mode = os.stat(fallback).st_mode & 0o777
+        check("auth: fallback 0600", mode == 0o600, oct(mode))
+        auth.logout()
+        check("auth: logout remove fallback", not os.path.exists(fallback))
+        zsync._run_tool = orig_run
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def unit_auto_sync():
+    """auto_sync: dispara detached, grava marker+log, respeita throttle."""
+    env = dict(os.environ)
+    dd = tempfile.mkdtemp(prefix="zsync-auto-")
+    env["ZCODE_PLUGIN_DATA"] = dd
+    env.pop("ZCODE_ZSYNC_GCP", None)
+    try:
+        r = subprocess.run([sys.executable, os.path.join(HERE, "..", "scripts", "auto_sync.py"), "start"],
+                           capture_output=True, text=True, env=env, timeout=15)
+        check("auto: exit 0", r.returncode == 0, r.stderr[:200])
+        check("auto: marker criado", os.path.exists(os.path.join(dd, ".last-auto-sync")))
+        with open(os.path.join(dd, "auto-sync.log")) as f:
+            content = f.read()
+        check("auto: log registra disparo", "disparado" in content, content[:100])
+        r2 = subprocess.run([sys.executable, os.path.join(HERE, "..", "scripts", "auto_sync.py"), "start"],
+                            capture_output=True, text=True, env=env, timeout=15)
+        with open(os.path.join(dd, "auto-sync.log")) as f:
+            lines = [l for l in f.read().splitlines() if "disparado" in l]
+        check("auto: throttle segura 2º disparo", r2.returncode == 0 and len(lines) == 1)
+    finally:
+        shutil.rmtree(dd, ignore_errors=True)
+
+
 def main():
     unit_merge3()
+    unit_auth_fallback()
+    unit_auto_sync()
     integration()
     print("")
     print("PASS: %d  FAIL: %d" % (len(PASS), len(FAIL)))

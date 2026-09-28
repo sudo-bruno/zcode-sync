@@ -108,11 +108,18 @@ def write_json(path, obj, mode=None):
     atomic_write(path, json.dumps(obj, indent=2, ensure_ascii=False).encode("utf-8"), mode)
 
 
+def _run_tool(args, timeout=10):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except (FileNotFoundError, OSError):
+        return None
+
+
 def device_name():
-    r = subprocess.run(["scutil", "--ComputerName"], capture_output=True, text=True)
-    name = r.stdout.strip() if r.returncode == 0 else ""
+    r = _run_tool(["scutil", "--ComputerName"])  # macOS
+    name = r.stdout.strip() if r and r.returncode == 0 else ""
     if not name:
-        name = platform.node().split(".")[0] or "maquina"
+        name = platform.node().split(".")[0] or "maquina"  # Linux/qualquer Unix
     keep = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
     return "".join(c if c in keep else "-" for c in name)[:40]
 
@@ -383,10 +390,12 @@ def gcp_config():
     return None
 
 
+# Keychain no macOS; fallback universal: arquivo 0600 no diretório de dados
+# do plugin (Linux não tem `security`; gnome-kwallet exigiria dependências).
+
 def keychain_get():
-    r = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", "default", "-w"],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
+    r = _run_tool(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", "default", "-w"])
+    if r is None or r.returncode != 0:
         return None
     return read_json_text(r.stdout.strip())
 
@@ -399,14 +408,13 @@ def read_json_text(text):
 
 
 def keychain_set(obj):
-    r = subprocess.run(["security", "add-generic-password", "-s", KEYCHAIN_SERVICE, "-a", "default",
-                        "-w", json.dumps(obj), "-U"], capture_output=True)
-    return r.returncode == 0
+    r = _run_tool(["security", "add-generic-password", "-s", KEYCHAIN_SERVICE, "-a", "default",
+                   "-w", json.dumps(obj), "-U"])
+    return r is not None and r.returncode == 0
 
 
 def keychain_delete():
-    subprocess.run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", "default"],
-                   capture_output=True)
+    _run_tool(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", "default"])
 
 
 class Auth:
@@ -1027,12 +1035,32 @@ def cmd_sync(ctx, args_json):
         release_lock(lock)
 
 
+def last_auto_sync_line(data_dir):
+    log = os.path.join(data_dir, "auto-sync.log")
+    try:
+        with open(log, "r", encoding="utf-8", errors="replace") as f:
+            lines = [l.strip() for l in f.read().splitlines() if l.strip()]
+    except OSError:
+        return None
+    if not lines:
+        return None
+    # a linha final útil: resultado do último sync (linha JSON do --json não existe
+    # aqui porque o spawn roda sem --json; mostro a última linha relevante)
+    for l in reversed(lines):
+        if l.startswith("Sincronização") or l.startswith("Erro") or l.startswith("["):
+            return l
+    return lines[-1]
+
+
 def cmd_status(ctx, args_json):
     lines = ["dispositivo: %s" % ctx.device,
              "raiz sincronizada: %s" % ctx.root,
              "whitelist: %s" % ", ".join(SYNC_ROOTS)]
     email = ctx.auth.logged_email()
     lines.append("conta Google: %s" % (email or "não logado — rode /zsync:login"))
+    auto = last_auto_sync_line(ctx.data_dir)
+    if auto:
+        lines.append("último auto-sync: %s" % auto)
     local = scan(ctx.root)
     state = ctx.state()
     base = (state.get("base") if state else None) or {}

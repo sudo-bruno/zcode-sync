@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${ZCODE_PLUGIN_ROOT}/scripts/auto_sync.py\" start",
+            "timeout": 10,
+            "statusMessage": "zcode-sync: sincronizando em segundo plano"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${ZCODE_PLUGIN_ROOT}/scripts/auto_sync.py\" stop",
+            "timeout": 10,
+            "statusMessage": "zcode-sync: push em segundo plano"
+          }
+        ]
+      }
+    ]
+  }
+}
