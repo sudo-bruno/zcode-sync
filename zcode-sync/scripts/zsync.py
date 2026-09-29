@@ -19,6 +19,7 @@ import json
 import os
 import platform
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -30,7 +31,7 @@ import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-VERSION = "0.1.0"
+VERSION = "0.7.0"
 
 OAUTH_AUTH = "https://accounts.google.com/o/oauth2/v2/auth"
 OAUTH_TOKEN = "https://oauth2.googleapis.com/token"
@@ -61,6 +62,16 @@ KEYCHAIN_SERVICE = "zcode-sync"
 STATE_FILE = "local-state.json"
 CONFLICTS_FILE = "conflicts.json"
 LOCK_FILE = "lock"
+
+# 0.7.0 — o estado vive FORA do diretório de dados do plugin (~/.zcode/cli/zsync):
+# o app apaga cli/plugins/data/<plugin> no uninstall (update preserva), e perder
+# o "base" transformaria o próximo sync num first-sync barulhento.
+STATE_DIR_NAME = os.path.join("cli", "zsync")
+STATE_MIGRATE_FILES = (STATE_FILE, CONFLICTS_FILE, "device.json", "access.json",
+                       "auth.json", "auto-sync.log", ".last-auto-sync")
+# Gerações de backup retidas em <estado>/backup/<geração>/ (uma por sync que
+# alterou arquivos; as antigas são podadas no início do sync seguinte).
+BACKUP_GENERATIONS = 5
 
 
 class SyncError(Exception):
@@ -131,6 +142,44 @@ def device_name():
         name = platform.node().split(".")[0] or "maquina"  # Linux/qualquer Unix
     keep = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
     return "".join(c if c in keep else "-" for c in name)[:40]
+
+
+def resolve_state_dir(root, explicit=None):
+    """Diretório de estado: --data > ZSYNC_STATE_DIR > <root>/cli/zsync.
+
+    Na primeira execução migra o estado do local legado (cli/plugins/data/zcode-sync@*),
+    que o app apaga no uninstall do plugin."""
+    if explicit:
+        d = os.path.abspath(explicit)
+        os.makedirs(d, exist_ok=True)
+        return d
+    env_dir = os.environ.get("ZSYNC_STATE_DIR")
+    if env_dir:
+        d = os.path.abspath(env_dir)
+        os.makedirs(d, exist_ok=True)
+        return d
+    d = os.path.join(root, STATE_DIR_NAME)
+    if not os.path.isdir(d):
+        base = os.path.join(root, "cli", "plugins", "data")
+        for legacy in sorted(glob.glob(os.path.join(base, "zcode-sync@*"))) + \
+                [os.path.join(base, "zcode-sync")]:
+            if os.path.isdir(legacy):
+                _migrate_state(legacy, d)
+                break
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _migrate_state(src, dst):
+    os.makedirs(dst, exist_ok=True)
+    for name in STATE_MIGRATE_FILES:
+        s = os.path.join(src, name)
+        d = os.path.join(dst, name)
+        if os.path.exists(s) and not os.path.exists(d):
+            try:
+                shutil.copy2(s, d)
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------
@@ -665,6 +714,67 @@ def _add_file(files, root, fpath):
 
 
 # --------------------------------------------------------------------------
+# Quarentena de rebaixamento (0.7.0)
+# --------------------------------------------------------------------------
+
+def _json_weight(v):
+    """Número total de chaves/elementos num valor JSON (recursivo)."""
+    if isinstance(v, dict):
+        return len(v) + sum(_json_weight(x) for x in v.values())
+    if isinstance(v, list):
+        return len(v) + sum(_json_weight(x) for x in v)
+    return 0
+
+
+def json_downgrade_risk(ours_data, theirs_data):
+    """True se a versão remota (theirs) é um JSON-objeto muito mais pobre que o
+    nosso (ours) — o padrão clássico de um arquivo de estado de instalação nova
+    (ex.: provider_config.json de 206 B) prestes a substituir uma config rica.
+
+    Só dispara em JSON (arquivos do whitelist em geral são .md); arquivos pequenos
+    (< 6 chaves) nunca disparam, para não gerar ruído."""
+    try:
+        ours = json.loads(ours_data.decode("utf-8"))
+        theirs = json.loads(theirs_data.decode("utf-8"))
+    except (ValueError, AttributeError, UnicodeDecodeError):
+        return False
+    if not isinstance(ours, dict) or not isinstance(theirs, dict):
+        return False
+    w_ours = _json_weight(ours)
+    if w_ours < 6:
+        return False
+    return _json_weight(theirs) * 2 < w_ours
+
+
+# --------------------------------------------------------------------------
+# Atribuição de autoria no manifesto (0.7.0)
+# --------------------------------------------------------------------------
+
+def attr_entry(entry, device, ts=None):
+    """Anotação de autoria: quem produziu este conteúdo e quando."""
+    e = dict(entry)
+    e.setdefault("by", device)
+    e.setdefault("at", ts or now_iso())
+    return e
+
+
+def with_attribution(files, remote_files, device, ts=None):
+    """Normaliza autoria antes do push: entrada já anotada passa; sem anotação,
+    herda a do conteúdo idêntico no remoto; caso contrário, é nossa."""
+    out = {}
+    for p, e in files.items():
+        if e.get("by"):
+            out[p] = e
+            continue
+        r = (remote_files or {}).get(p)
+        if r and r.get("sha256") == e["sha256"] and r.get("by"):
+            out[p] = dict(r)
+        else:
+            out[p] = attr_entry(e, device, ts)
+    return out
+
+
+# --------------------------------------------------------------------------
 # Estado local, lock e conflitos
 # --------------------------------------------------------------------------
 
@@ -672,15 +782,7 @@ class Ctx:
     def __init__(self, args):
         self.root = os.path.abspath(args.root or os.path.join(os.path.expanduser("~"), ".zcode"))
         self.compact = bool(getattr(args, "compact", False))
-        data_dir = args.data or os.environ.get("ZCODE_PLUGIN_DATA")
-        if not data_dir:
-            # auto-detecta o diretório de dados oficial do plugin (zcode-sync@<mercado>),
-            # para que qualquer invocação — hook, comando ou terminal — use o mesmo estado
-            base = os.path.join(self.root, "cli", "plugins", "data")
-            hits = sorted(glob.glob(os.path.join(base, "zcode-sync@*")))
-            data_dir = hits[-1] if hits else os.path.join(base, "zcode-sync")
-        self.data_dir = os.path.abspath(data_dir)
-        os.makedirs(self.data_dir, exist_ok=True)
+        self.data_dir = resolve_state_dir(self.root, getattr(args, "data", None))
         self.backend = make_backend(args)
         self.auth = Auth(self.data_dir)
         self.device = args.device or read_json(os.path.join(self.data_dir, "device.json"), {}).get("device") \
@@ -688,6 +790,8 @@ class Ctx:
         write_json(os.path.join(self.data_dir, "device.json"), {"device": self.device})
         self.state_path = os.path.join(self.data_dir, STATE_FILE)
         self.conflicts_path = os.path.join(self.data_dir, CONFLICTS_FILE)
+        self.backup_root = os.path.join(self.data_dir, "backup")
+        self.sync_generation = None  # definido a cada run_sync (nome da geração de backup)
 
     def state(self):
         return read_json(self.state_path)
@@ -721,34 +825,44 @@ class Ctx:
             return f.read()
 
     def write_local(self, rel, data):
+        if rel in NEVER_SYNC:
+            raise SyncError("defesa: %s é por máquina e nunca é escrito pelo sync (bug)" % rel)
         path = self.local_path(rel)
-        if rel in PROTECTED_FILES and os.path.exists(path):
+        if os.path.exists(path):
             with open(path, "rb") as f:
                 old = f.read()
             if old != data:
-                self._backup(path, old)
+                self._backup(rel, old)
         atomic_write(path, data)
 
-    def _backup(self, path, old):
-        """Cópia local do conteúdo antigo de arquivo de config (só nesta máquina)."""
-        dest = "%s%s%s" % (path, BACKUP_MARKER, now_stamp())
+    def _backup(self, rel, old):
+        """Copia o conteúdo antigo para <estado>/backup/<geração>/<caminho> antes de
+        sobrescrever/apagar — rede de segurança local, uma geração por sync."""
+        if not self.sync_generation:
+            return
+        dest = os.path.join(self.backup_root, self.sync_generation, rel.replace("/", os.sep))
         try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
             atomic_write(dest, old, mode=0o600)
         except OSError:
             return
-        olds = sorted(glob.glob(path + BACKUP_MARKER + "*"))
-        for extra in olds[:-5]:
-            try:
-                os.remove(extra)
-            except OSError:
-                pass
+
+    def prune_backup_generations(self):
+        try:
+            gens = sorted(d for d in os.listdir(self.backup_root)
+                          if os.path.isdir(os.path.join(self.backup_root, d)))
+        except OSError:
+            return
+        for extra in gens[:-BACKUP_GENERATIONS]:
+            shutil.rmtree(os.path.join(self.backup_root, extra), ignore_errors=True)
 
     def delete_local(self, rel):
+        if rel in NEVER_SYNC:
+            raise SyncError("defesa: %s é por máquina e nunca é apagado pelo sync (bug)" % rel)
         p = self.local_path(rel)
         if os.path.exists(p):
-            if rel in PROTECTED_FILES:
-                with open(p, "rb") as f:
-                    self._backup(p, f.read())
+            with open(p, "rb") as f:
+                self._backup(rel, f.read())
             os.remove(p)
         # remove diretórios vazios deixados para trás dentro do whitelist
         d = os.path.dirname(p)
@@ -912,6 +1026,8 @@ def verify_and_put_manifest(ctx, backend, remote_version, manifest):
 def run_sync(ctx):
     report = Report()
     backend = get_backend(ctx)
+    ctx.sync_generation = now_stamp()
+    ctx.prune_backup_generations()
     local = scan(ctx.root)
     remote = backend.get_manifest()
     state = ctx.state()
@@ -919,7 +1035,8 @@ def run_sync(ctx):
 
     # ---- remoto vazio -----------------------------------------------------
     if remote is None:
-        manifest = {"version": 1, "updated": now_iso(), "device": ctx.device, "files": local}
+        manifest = {"version": 1, "updated": now_iso(), "device": ctx.device,
+                    "files": {p: attr_entry(e, ctx.device) for p, e in local.items()}}
         for rel, entry in sorted(local.items()):
             ensure_blob(ctx, backend, rel, entry)
         verify_and_put_manifest(ctx, backend, 0, manifest)
@@ -964,7 +1081,7 @@ def run_sync(ctx):
                 new_files[p] = rentry
                 continue
             ensure_blob(ctx, backend, p, lentry)
-            new_files[p] = lentry
+            new_files[p] = attr_entry(lentry, ctx.device)
             report.add("enviado", p)
         if not report.events and new_files == remote.get("files", {}):
             # nada mudou dos dois lados: só realinhar o estado (sem push desnecessário)
@@ -972,7 +1089,8 @@ def run_sync(ctx):
             ctx.save_conflicts(pending)
             return report, False
         version = remote["version"] + 1
-        manifest = {"version": version, "updated": now_iso(), "device": ctx.device, "files": new_files}
+        manifest = {"version": version, "updated": now_iso(), "device": ctx.device,
+                    "files": with_attribution(new_files, remote.get("files", {}), ctx.device)}
         verify_and_put_manifest(ctx, backend, remote["version"], manifest)
         ctx.save_state(version, {p: e["sha256"] for p, e in new_files.items()})
         ctx.save_conflicts(pending)
@@ -1005,8 +1123,20 @@ def run_sync(ctx):
             # local intocado desde o último encontro → aplica o lado remoto
             if rsha is not None:
                 data = blob_get(ctx, backend, rsha)
+                if lentry is not None and json_downgrade_risk(ctx.read_local(p), data):
+                    # quarentena (0.7.0): o remoto parece um estado de instalação nova
+                    # (JSON muito mais pobre). Não aplica; preserva como conflito.
+                    copy = write_conflict_copy(ctx, p, data, rsha, remote, cp)
+                    new_conflicts[p] = {"kind": "downgrade", "theirs_sha": rsha, "copy": copy,
+                                        "remote_device": remote.get("device", "?"), "ts": now_stamp()}
+                    converged_base[p] = bsha
+                    report.add("conflito", p,
+                               "remoto muito mais pobre (instalação nova?) — lado local preservado — /zsync:resolve")
+                    continue
                 ctx.write_local(p, data)
-                final[p] = {"sha256": rsha, "size": len(data)}
+                final[p] = attr_entry({"sha256": rsha, "size": len(data)},
+                                      rentry.get("by") or remote.get("device", "?"),
+                                      rentry.get("at") or remote.get("updated"))
                 converged_base[p] = rsha
                 report.add("baixado", p, "alteração remota aplicada")
             else:
@@ -1073,7 +1203,8 @@ def run_sync(ctx):
 
     # sem conflitos → push do resultado rebased
     version = remote["version"] + 1
-    manifest = {"version": version, "updated": now_iso(), "device": ctx.device, "files": final}
+    manifest = {"version": version, "updated": now_iso(), "device": ctx.device,
+                "files": with_attribution(final, remote.get("files", {}), ctx.device)}
     for rel, entry in sorted(final.items()):
         if not backend.has_object(entry["sha256"]):
             backend.put_object(entry["sha256"], ctx.read_local(rel))
@@ -1318,7 +1449,7 @@ def cmd_projects(ctx, args_json, args):
 def main(argv):
     ap = argparse.ArgumentParser(prog="zsync", description="zcode-sync — sync ~/.zcode via Google Drive")
     ap.add_argument("--root", help="raiz a sincronizar (padrão ~/.zcode)")
-    ap.add_argument("--data", help="diretório de estado (padrão ${ZCODE_PLUGIN_DATA})")
+    ap.add_argument("--data", help="diretório de estado (padrão: ~/.zcode/cli/zsync)")
     ap.add_argument("--backend", help="backend de teste: file:<dir> (padrão: Google Drive)")
     ap.add_argument("--device", help="nome do dispositivo (padrão: nome do computador)")
     ap.add_argument("--json", action="store_true", help="saída JSON para o agente")

@@ -5,7 +5,6 @@
 #
 # Modos: start = SessionStart (throttle 15s) | stop = Stop (throttle 300s)
 
-import glob
 import os
 import sys
 import time
@@ -19,10 +18,12 @@ LOG_MAX = 200 * 1024
 
 
 def data_dir():
-    d = os.environ.get("ZCODE_PLUGIN_DATA")
+    """Mesma resolução do zsync.resolve_state_dir: estado fora do diretório de
+    dados do plugin (que o app apaga no uninstall)."""
+    d = os.environ.get("ZSYNC_STATE_DIR")
     if not d:
-        hits = sorted(glob.glob(os.path.expanduser("~/.zcode/cli/plugins/data/zcode-sync@*")))
-        d = hits[-1] if hits else os.path.expanduser("~/.zcode/cli/plugins/data/zcode-sync")
+        root = os.environ.get("ZSYNC_ROOT") or os.path.expanduser("~/.zcode")
+        d = os.path.join(root, "cli", "zsync")
     os.makedirs(d, exist_ok=True)
     return d
 

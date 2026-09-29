@@ -2,6 +2,7 @@
 # Testes offline do zcode-sync: duas "máquinas" fake sobre backend de diretório.
 # Uso: python3 tests/test_engine.py   (a partir da raiz do plugin)
 
+import argparse
 import gzip
 import glob
 import json
@@ -272,6 +273,132 @@ def integration():
         lab.cleanup()
 
 
+def integration_p1():
+    """0.7.0 — quarentena de rebaixamento, backup por geração, autoria e migração de estado."""
+    lab = Lab()
+    try:
+        # t14 — quarentena: remoto "instalação nova" (JSON muito mais pobre) não aplica
+        rich = json.dumps({"schemaVersion": 1, "config": {
+            "providerOrder": ["a", "b", "c"],
+            "providerConfigRules": [{"id": "r1", "z": 1}, {"id": "r2", "z": 2}],
+            "modelConfigRules": [{"id": "m1"}, {"id": "m2"}],
+            "defaultModelSelection": {"provider": "a", "model": "x"},
+        }})
+        poor = json.dumps({"schemaVersion": 1, "config": {
+            "providerConfigRules": [], "modelConfigRules": []}})
+        lab.write("m1", "zsync-projects.json", rich)
+        r = lab.run("m1", "sync")
+        check("t14: m1 sobe a config rica", r["ok"], str(r))
+        r = lab.run("m2", "sync")
+        check("t14: m2 clona a config rica", r["ok"] and lab.read("m2", "zsync-projects.json") == rich, str(r))
+        # m2 tem o arquivo substituído por um estado de instalação nova (como no incidente)
+        lab.write("m2", "zsync-projects.json", poor)
+        r = lab.run("m2", "sync")
+        check("t14: m2 empurra o estado pobre (comportamento antigo que gerou o incidente)",
+              r["ok"] and r["pushed"], str(r))
+        r = lab.run("m1", "sync")
+        check("t14: m1 coloca o remoto pobre em QUARENTENA (não aplica)",
+              r["ok"] and not r["pushed"] and
+              any(e["type"] == "conflito" and "pobre" in e["detail"] for e in r["events"]),
+              str(r["events"])[:300])
+        check("t14: lado local rico preservado", lab.read("m1", "zsync-projects.json") == rich,
+              repr(lab.read("m1", "zsync-projects.json"))[:120])
+        copies = glob.glob(lab.path("m1", "zsync-projects.json.sync-conflict-*"))
+        check("t14: cópia do lado remoto guardada", len(copies) == 1, str(copies))
+        r = lab.run("m1", "resolve", ["--path", "zsync-projects.json", "--choice", "take-theirs"])
+        check("t14: resolve assume o lado remoto quando é isso mesmo", r["ok"], str(r))
+
+        # t15 — backup por geração: sobrescrita guarda o conteúdo antigo
+        lab.write("m1", "agents/a.md", "conteúdo geracao-1\n")
+        r = lab.run("m1", "sync")
+        check("t15: m1 empurra geração 1", r["ok"] and r["pushed"], str(r))
+        r = lab.run("m2", "sync")
+        check("t15: m2 baixa geração 1", r["ok"], str(r))
+        lab.write("m2", "agents/a.md", "conteúdo geracao-2\n")
+        r = lab.run("m2", "sync")
+        r = lab.run("m1", "sync")
+        check("t15: m1 recebe geração 2", lab.read("m1", "agents/a.md") == "conteúdo geracao-2\n", str(r))
+        backups = glob.glob(os.path.join(lab.data("m1"), "backup", "*", "agents", "a.md"))
+        check("t15: backup da versão anterior existe em <estado>/backup/<geração>/",
+              len(backups) == 1 and open(backups[0]).read() == "conteúdo geracao-1\n", str(backups))
+
+        # t16 — autoria: entradas do manifesto registram quem produziu o conteúdo
+        manifest = json.load(open(os.path.join(lab.backend, "manifest.json")))
+        e = manifest["files"].get("agents/a.md", {})
+        check("t16: entrada tem autoria (by/at)", e.get("by") == "m2" and bool(e.get("at")), str(e))
+        zp = manifest["files"].get("zsync-projects.json", {})
+        check("t16: autoria segue o produtor do conteúdo (m2 empurrou o estado pobre)",
+              zp.get("by") == "m2", str(zp))
+        check("t16: todas as entradas anotadas",
+              all("by" in v and "at" in v for v in manifest["files"].values()),
+              str(manifest["files"])[:200])
+
+        # t17 — defesa: NEVER_SYNC nunca é escrito pelo motor
+        try:
+            ctx = zsync.Ctx(argparse.Namespace(root=lab.root("m1"), data=lab.data("m1"),
+                                               backend="file:" + lab.backend, device="m1",
+                                               compact=False))
+            ctx.sync_generation = "g-test"
+            ctx.write_local("v2/provider_config.json", b"{}")
+            check("t17: write_local recusa NEVER_SYNC", False, "não levantou")
+        except zsync.SyncError:
+            check("t17: write_local recusa NEVER_SYNC", True)
+        except Exception as ex:
+            check("t17: write_local recusa NEVER_SYNC", False, repr(ex))
+    finally:
+        lab.cleanup()
+
+
+def unit_p1():
+    """0.7.0 — heurística de downgrade e migração de estado."""
+    rich = json.dumps({"a": 1, "b": 2, "c": 3, "d": {"x": 1, "y": 2}, "e": [1, 2, 3], "f": 4})
+    poor = json.dumps({"a": 1})
+    check("quarentena: rico→pobre dispara", zsync.json_downgrade_risk(rich.encode(), poor.encode()))
+    check("quarentena: pobre→rico NÃO dispara",
+          not zsync.json_downgrade_risk(poor.encode(), rich.encode()))
+    check("quarentena: conteúdo igual não dispara",
+          not zsync.json_downgrade_risk(rich.encode(), rich.encode()))
+    check("quarentena: não-JSON não dispara",
+          not zsync.json_downgrade_risk(b"# markdown\n", b"# outro\n"))
+    check("quarentena: JSON pequeno não dispara",
+          not zsync.json_downgrade_risk(b'{"a":1,"b":2}', b'{"a":1}'))
+    check("quarentena: lista no lugar de objeto não dispara",
+          not zsync.json_downgrade_risk(json.dumps([1, 2, 3, 4, 5]).encode(), b"[]"))
+
+    e = zsync.attr_entry({"sha256": "x", "size": 1}, "dev-A")
+    check("autoria: attr_entry anota by/at", e.get("by") == "dev-A" and bool(e.get("at")), str(e))
+    out = zsync.with_attribution(
+        {"p1": {"sha256": "s1", "size": 1}, "p2": {"sha256": "s2", "size": 2, "by": "outro"}},
+        {"p1": {"sha256": "s1", "size": 1, "by": "remoto", "at": "t"}},
+        "dev-B")
+    check("autoria: sem anotação + conteúdo igual herda do remoto", out["p1"].get("by") == "remoto", str(out))
+    check("autoria: anotação existente é preservada", out["p2"].get("by") == "outro", str(out))
+
+    # migração: estado legado em cli/plugins/data/zcode-sync@mercado → cli/zsync
+    base = tempfile.mkdtemp(prefix="zsync-mig-")
+    try:
+        root = os.path.join(base, ".zcode")
+        legacy = os.path.join(root, "cli", "plugins", "data", "zcode-sync@dev-default-zsync")
+        os.makedirs(os.path.join(legacy, "cli"), exist_ok=True)
+        with open(os.path.join(legacy, "local-state.json"), "w") as f:
+            f.write('{"last_remote_version": 7}')
+        with open(os.path.join(legacy, "auth.json"), "w") as f:
+            f.write('{"refresh_token":"t"}')
+        os.chmod(os.path.join(legacy, "auth.json"), 0o600)
+        env = dict(os.environ)
+        env.pop("ZSYNC_STATE_DIR", None)
+        d = zsync.resolve_state_dir(root, None)
+        check("migração: estado novo em <root>/cli/zsync", d == os.path.join(root, "cli", "zsync"), d)
+        check("migração: local-state.json migrado",
+              zsync.read_json(os.path.join(d, "local-state.json"), {}).get("last_remote_version") == 7)
+        check("migração: auth.json migrado",
+              zsync.read_json(os.path.join(d, "auth.json"), {}).get("refresh_token") == "t")
+        # legado intocado (fica como backup passivo)
+        check("migração: legado preservado", os.path.exists(os.path.join(legacy, "local-state.json")))
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
 def unit_auth_fallback():
     """Sem binário `security` (Linux): save() cai pro arquivo 0600 e creds voltam."""
     base = tempfile.mkdtemp(prefix="zsync-auth-")
@@ -296,7 +423,7 @@ def unit_auto_sync():
     """auto_sync: dispara detached, grava marker+log, respeita throttle."""
     env = dict(os.environ)
     dd = tempfile.mkdtemp(prefix="zsync-auto-")
-    env["ZCODE_PLUGIN_DATA"] = dd
+    env["ZSYNC_STATE_DIR"] = dd
     env.pop("ZCODE_ZSYNC_GCP", None)
     try:
         r = subprocess.run([sys.executable, os.path.join(HERE, "..", "scripts", "auto_sync.py"), "start"],
@@ -728,7 +855,9 @@ def main():
     unit_lock()
     unit_sessions()
     unit_projects()
+    unit_p1()
     integration()
+    integration_p1()
     print("")
     print("PASS: %d  FAIL: %d" % (len(PASS), len(FAIL)))
     if FAIL:

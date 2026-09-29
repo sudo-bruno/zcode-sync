@@ -54,9 +54,26 @@ def human(n):
 
 
 def detect_data_dir(root):
-    base = os.path.join(root, "cli", "plugins", "data")
-    hits = sorted(glob.glob(os.path.join(base, "zcode-sync@*")))
-    return hits[-1] if hits else os.path.join(base, "zcode-sync")
+    """Mesma resolução do zsync.resolve_state_dir sem --data: estado vive fora do
+    diretório de dados do plugin (que o app apaga no uninstall); na primeira run
+    migra sessions-state.json do local legado."""
+    d = os.path.join(root, "cli", "zsync")
+    if not os.path.isdir(d):
+        base = os.path.join(root, "cli", "plugins", "data")
+        for legacy in sorted(glob.glob(os.path.join(base, "zcode-sync@*"))) + \
+                [os.path.join(base, "zcode-sync")]:
+            if os.path.isdir(legacy):
+                os.makedirs(d, exist_ok=True)
+                s = os.path.join(legacy, "sessions-state.json")
+                t = os.path.join(d, "sessions-state.json")
+                if os.path.exists(s) and not os.path.exists(t):
+                    try:
+                        shutil.copy2(s, t)
+                    except OSError:
+                        pass
+                break
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 def atomic_write(path, data, mode=0o600):
@@ -381,7 +398,7 @@ def main(argv):
     ap.add_argument("action", choices=["status", "export", "import"])
     args = ap.parse_args(argv)
     root = os.path.abspath(args.root)
-    data_dir = args.data or os.environ.get("ZCODE_PLUGIN_DATA") or detect_data_dir(root)
+    data_dir = args.data or os.environ.get("ZSYNC_STATE_DIR") or detect_data_dir(root)
     os.makedirs(data_dir, exist_ok=True)
     if args.action == "status":
         r = status(root, data_dir)
