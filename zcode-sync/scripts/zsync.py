@@ -31,7 +31,7 @@ import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 
 OAUTH_AUTH = "https://accounts.google.com/o/oauth2/v2/auth"
 OAUTH_TOKEN = "https://oauth2.googleapis.com/token"
@@ -41,18 +41,30 @@ DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3"
 
 SCOPES = "openid email https://www.googleapis.com/auth/drive.appdata"
 
-# Whitelist fechada: só isto sincroniza. Nada de cli/config.json, cli/db, v2/credentials.json, workspace/.
-# v2/config.json e v2/provider_config.json NÃO sincronizam (0.6.2): providers são
-# por máquina — sincronizar sobrescreveu a config de uma ponta com a da outra.
+# Whitelist fechada: só isto sincroniza. Nada de cli/db, credentials.json, workspace/.
 # cli/zsync-projects (0.10.0): acks por máquina do sync de código por bundle git.
+# Configs (0.11.0) voltam ao sync com MERGE ESTRUTURAL (ver CONFIG_FILES):
+# setting.json, cli/config.json (hooks/MCP), agents-state e os configs de provider
+# — o merge por chave/campo preserva os dois lados; o incidente do 0.6 (arquivo
+# de instalação nova por cima do rico) vira não-evento e continua bloqueado
+# pela quarentena de rebaixamento.
 SYNC_ROOTS = ["skills", "agents", "commands", "AGENTS.md", os.path.join("cli", "memories"),
               os.path.join("cli", "sessions-export"), "zsync-projects.json",
-              os.path.join("cli", "zsync-projects")]
-SINGLE_FILES = {"AGENTS.md", "zsync-projects.json"}
-# Nunca tocados pelo sync, mesmo se entrarem no manifesto por uma máquina antiga.
-NEVER_SYNC = {"v2/config.json", "v2/provider_config.json"}
-# Arquivos de config: backup local antes de qualquer sobrescrita/deleção (rede de segurança).
-PROTECTED_FILES = {"v2/config.json", "v2/provider_config.json"}
+              os.path.join("cli", "zsync-projects"),
+              os.path.join("v2", "setting.json"), os.path.join("cli", "config.json"),
+              os.path.join("v2", "agents-state.json"), os.path.join("v2", "config.json"),
+              os.path.join("v2", "provider_config.json")]
+SINGLE_FILES = {"AGENTS.md", "zsync-projects.json", os.path.join("v2", "setting.json"),
+                os.path.join("cli", "config.json"), os.path.join("v2", "agents-state.json"),
+                os.path.join("v2", "config.json"), os.path.join("v2", "provider_config.json")}
+# Configs que sincronizam com merge estrutural e podem ser desligadas pela
+# opção de usuário syncConfigs (Settings → plugin → Configurar).
+CONFIG_FILES = {os.path.join("v2", "setting.json"), os.path.join("cli", "config.json"),
+                os.path.join("v2", "agents-state.json"), os.path.join("v2", "config.json"),
+                os.path.join("v2", "provider_config.json")}
+# Mecanismo de defesa: caminhos aqui NUNCA são escritos pelo motor (hoje vazio;
+# os configs de provider agora sincronizam via merge estrutural).
+NEVER_SYNC = set()
 
 IGNORE_NAMES = {".DS_Store", "__pycache__", ".git"}
 IGNORE_SUFFIXES = (".pyc",)
@@ -135,6 +147,22 @@ def _run_tool(args, timeout=10):
         return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     except (FileNotFoundError, OSError):
         return None
+
+
+def read_plugin_options(root):
+    """Opções userConfig do plugin (todos os marketplaces zcode-sync@*), mescladas.
+    Lidas de <root>/cli/config.json → plugins.options."""
+    try:
+        with open(os.path.join(root, "cli", "config.json"), "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    opts = (cfg.get("plugins", {}) or {}).get("options", {}) or {}
+    merged = {}
+    for key in sorted(opts):
+        if key.startswith("zcode-sync@") and isinstance(opts[key], dict):
+            merged.update(opts[key])
+    return merged
 
 
 def device_name():
@@ -288,6 +316,161 @@ def merge3_bytes(base_b, ours_b, theirs_b):
         return None, True
     merged, conflict = merge3(base_l, ours_l, theirs_l)
     return "".join(merged).encode("utf-8"), conflict
+
+
+# --------------------------------------------------------------------------
+# Merge estrutural de JSON (0.11.0) — o "dif inteligente" do zsync para configs
+# --------------------------------------------------------------------------
+
+JSON_ID_KEYS = ("id", "name", "key", "server", "path", "command", "url")
+
+
+def _json_item_id(item):
+    """Identidade de um item de lista: chave de identidade se houver, senão o
+    conteúdo serializado (item sem identidade que muda = remove+adiciona)."""
+    if isinstance(item, dict):
+        for k in JSON_ID_KEYS:
+            v = item.get(k)
+            if isinstance(v, (str, int, float, bool)):
+                return "%s=%s" % (k, v)
+    return json.dumps(item, sort_keys=True, ensure_ascii=False)
+
+
+def merge_json3(base, ours, theirs, path="$"):
+    """Merge 3 vias ESTRUTURAL (por chave/campo, não por linha).
+
+    Regras: chave/campo mudado em só um lado → esse lado; mudado nos dois do
+    mesmo jeito → igual; containers recursam; empate escalar (mudado diferente
+    nos dois lados) fica com o valor LOCAL e é anotado em `conflicts` — o lado
+    remoto não se perde (vai para a cópia .sync-conflict-). NUNCA produz
+    estrutura inválida. base=None (arquivos criados nas duas máquinas) junta
+    os dois lados por união.
+    """
+    conflicts = []
+    b = base if base is not None else ({} if isinstance(ours, dict) else [])
+    if isinstance(b, dict) and isinstance(ours, dict) and isinstance(theirs, dict):
+        val = _merge_dict(b, ours, theirs, path, conflicts)
+        return val, conflicts
+    if isinstance(b, list) and isinstance(ours, list) and isinstance(theirs, list):
+        val = _merge_list(b, ours, theirs, path, conflicts)
+        return val, conflicts
+    if base is None:
+        # tipos diferentes criados nas duas pontas: local vence, anotado
+        if ours != theirs:
+            conflicts.append(path)
+        return ours, conflicts
+    if ours == base:
+        return theirs, conflicts      # só o remoto mudou
+    if theirs == base or ours == theirs:
+        return ours, conflicts        # só nós mudamos (ou convergiu)
+    if isinstance(ours, dict) and isinstance(theirs, dict):
+        return _merge_dict({}, ours, theirs, path, conflicts)
+    if isinstance(ours, list) and isinstance(theirs, list):
+        return _merge_list(base, ours, theirs, path, conflicts)
+    if ours != theirs:
+        conflicts.append(path)        # empate escalar: nosso valor vence
+    return ours, conflicts
+
+
+def _merge_dict(base, ours, theirs, path, conflicts):
+    out = {}
+    keys = list(ours.keys()) + [k for k in theirs.keys() if k not in ours]
+    for k in keys:
+        kp = "%s.%s" % (path, k)
+        o, t = ours.get(k), theirs.get(k)
+        in_b, b = (k in base), base.get(k)
+        if k not in theirs:
+            if not in_b:
+                out[k] = o            # só nós adicionamos
+            elif o == b:
+                pass                  # removido pelo remoto e intocado aqui
+            else:
+                out[k] = o            # modificamos, eles removeram → mantém + nota
+                conflicts.append(kp + " (modificado aqui, removido no remoto)")
+            continue
+        if k not in ours:
+            if not in_b:
+                out[k] = t            # só o remoto adicionou
+            elif t == b:
+                pass                  # removido aqui e intocado lá
+            else:
+                out[k] = t            # removido aqui, modificado lá → ressurei + nota
+                conflicts.append(kp + " (removido aqui, modificado no remoto)")
+            continue
+        if o == t:
+            out[k] = o
+        elif in_b and o == b:
+            out[k] = t
+        elif in_b and t == b:
+            out[k] = o
+        else:
+            out[k], c = merge_json3(b if in_b else None, o, t, kp)
+            conflicts.extend(c)
+    return out
+
+
+def _merge_list(base, ours, theirs, path, conflicts):
+    bmap = {_json_item_id(x): x for x in base}
+    omap = {_json_item_id(x): x for x in ours}
+    tmap = {_json_item_id(x): x for x in theirs}
+    out = []
+    for item in ours:                     # nossa ordem primeiro
+        iid = _json_item_id(item)
+        o, t, b = omap.get(iid), tmap.get(iid), bmap.get(iid)
+        if t is None:
+            if b is None:
+                out.append(item)          # só nós adicionamos
+            elif o == b:
+                pass                      # removido pelo remoto, intocado aqui
+            else:
+                out.append(item)          # modificamos, eles removeram → mantém
+                conflicts.append("%s[%s] (modificado aqui, removido no remoto)" % (path, iid))
+            continue
+        if o == t:
+            out.append(o)
+        elif b is not None and o == b:
+            out.append(t)
+        elif b is not None and t == b:
+            out.append(o)
+        elif isinstance(o, dict) and isinstance(t, dict):
+            merged, c = merge_json3(b if b is not None else None, o, t,
+                                    "%s[%s]" % (path, iid))
+            out.append(merged)
+            conflicts.extend(c)
+        else:
+            out.append(o)
+            conflicts.append("%s[%s] (empate — valor local manteve)" % (path, iid))
+    for iid, t in tmap.items():           # agora o que só existe no remoto
+        if iid in omap:
+            continue
+        b = bmap.get(iid)
+        if b is None:
+            out.append(t)                 # só o remoto adicionou
+        elif t == b:
+            pass                          # removido aqui, intocado lá
+        else:
+            out.append(t)                 # removido aqui, modificado lá → ressurei
+            conflicts.append("%s[%s] (removido aqui, modificado no remoto)" % (path, iid))
+    return out
+
+
+def _try_merge_json(ours_b, theirs_b, base_b=None):
+    """Se os três lados forem JSON (objeto/lista), faz o merge estrutural e
+    devolve (bytes_mesclados, conflitos). Caso contrário None (cai no merge
+    de texto)."""
+    def parse(b):
+        try:
+            v = json.loads(b.decode("utf-8"))
+        except (ValueError, AttributeError, UnicodeDecodeError):
+            return None
+        return v if isinstance(v, (dict, list)) else None
+    ours_v, theirs_v = parse(ours_b), parse(theirs_b)
+    if ours_v is None or theirs_v is None:
+        return None
+    base_v = parse(base_b) if base_b is not None else None
+    merged, conflicts = merge_json3(base_v, ours_v, theirs_v)
+    data = (json.dumps(merged, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    return data, conflicts
 
 
 # --------------------------------------------------------------------------
@@ -1155,6 +1338,11 @@ def run_sync(ctx):
     backend = get_backend(ctx)
     ctx.sync_generation = now_stamp()
     ctx.prune_backup_generations()
+    try:
+        configs_on = read_plugin_options(ctx.root).get("syncConfigs", True)
+    except Exception:
+        configs_on = True
+    eff_never = NEVER_SYNC | (set() if configs_on else CONFIG_FILES)
     local = scan(ctx.root)
     remote = backend.get_manifest()
     state = ctx.state()
@@ -1179,7 +1367,7 @@ def run_sync(ctx):
     if lrv == remote.get("version"):
         new_files = {}
         for p in sorted(set(remote.get("files", {})) | set(local)):
-            if p in NEVER_SYNC:
+            if p in eff_never:
                 continue
             lentry = local.get(p)
             rentry = remote["files"].get(p)
@@ -1230,7 +1418,7 @@ def run_sync(ctx):
     converged_base = {}          # novo base para caminhos não conflitados
 
     for p in sorted(set(base) | set(remote.get("files", {})) | set(local)):
-        if p in NEVER_SYNC:
+        if p in eff_never:
             continue
         bsha = base.get(p)
         lentry = local.get(p)
@@ -1294,6 +1482,19 @@ def run_sync(ctx):
             if p.startswith(SESS_EXPORT_DIR) and _auto_resolve_session(
                     ctx, p, lentry, rentry, backend, remote, final, converged_base, report):
                 continue
+            mj = _try_merge_json(ctx.read_local(p), blob_get(ctx, backend, rsha))
+            if mj is not None:
+                merged_b, jconf = mj
+                ctx.write_local(p, merged_b)
+                final[p] = attr_entry({"sha256": sha256_bytes(merged_b), "size": len(merged_b)}, ctx.device)
+                converged_base[p] = final[p]["sha256"]
+                if jconf:
+                    write_conflict_copy(ctx, p, blob_get(ctx, backend, rsha), rsha, remote, cp)
+                    report.add("mesclado", p,
+                               "merge estrutural (JSON): %d empate(s) — valor local manteve; remoto na cópia" % len(jconf))
+                else:
+                    report.add("mesclado", p, "merge estrutural (JSON): os dois lados unidos")
+                continue
             copy = write_conflict_copy(ctx, p, blob_get(ctx, backend, rsha), rsha, remote, cp)
             new_conflicts[p] = {"kind": "add/add", "theirs_sha": rsha, "copy": copy,
                                 "remote_device": remote.get("device", "?"), "ts": now_stamp()}
@@ -1308,10 +1509,23 @@ def run_sync(ctx):
         if p.startswith(SESS_EXPORT_DIR) and _auto_resolve_session(
                 ctx, p, lentry, rentry, backend, remote, final, converged_base, report):
             continue
+        mj = _try_merge_json(ours_data, theirs_data, base_data)
+        if mj is not None:
+            merged_b, jconf = mj
+            ctx.write_local(p, merged_b)
+            final[p] = attr_entry({"sha256": sha256_bytes(merged_b), "size": len(merged_b)}, ctx.device)
+            converged_base[p] = final[p]["sha256"]
+            if jconf:
+                write_conflict_copy(ctx, p, theirs_data, rsha, remote, cp)
+                report.add("mesclado", p,
+                           "merge estrutural (JSON): %d empate(s) — valor local manteve; remoto na cópia" % len(jconf))
+            else:
+                report.add("mesclado", p, "merge estrutural (JSON)")
+            continue
         merged, had_conflict = merge3_bytes(base_data, ours_data, theirs_data)
         if not had_conflict and merged is not None:
             ctx.write_local(p, merged)
-            final[p] = {"sha256": sha256_bytes(merged), "size": len(merged)}
+            final[p] = attr_entry({"sha256": sha256_bytes(merged), "size": len(merged)}, ctx.device)
             converged_base[p] = final[p]["sha256"]
             report.add("mesclado", p)
         else:

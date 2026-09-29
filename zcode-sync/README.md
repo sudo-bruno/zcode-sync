@@ -9,17 +9,25 @@ Plugin ZCode que sincroniza seus recursos entre máquinas usando o Google Drive 
 
 ## O que sincroniza (whitelist fechada)
 
-| Sincroniza | Nunca toca |
+| Sincroniza (com merge do zsync) | Nunca toca |
 |---|---|
-| `~/.zcode/skills/` | `~/.zcode/cli/config.json` (hooks/MCP da máquina) |
-| `~/.zcode/agents/` | `~/.zcode/cli/db` (o banco não viaja; sessões vão por `cli/sessions-export/`) |
-| `~/.zcode/commands/` | `~/.zcode/v2/credentials.json` (login) e `v2/config.json`/`v2/provider_config.json` (providers: **por máquina**) |
-| `~/.zcode/AGENTS.md` | `~/.zcode/v2/setting.json` (UI, por máquina) |
-| `~/.zcode/cli/memories/` | `~/.zcode/workspace/` e cache de plugins |
-| `~/.zcode/cli/sessions-export/` (sessões em gzip — ver abaixo) | |
-| `~/.zcode/zsync-projects.json` (manifesto de projetos) | |
+| `~/.zcode/skills/`, `agents/`, `commands/`, `AGENTS.md` | `~/.zcode/v2/credentials.json` (login da máquina) |
+| `~/.zcode/cli/memories/` | `~/.zcode/cli/db` (o banco não viaja; sessões vão por `cli/sessions-export/`) |
+| `~/.zcode/cli/sessions-export/` (sessões em gzip — ver abaixo) | `~/.zcode/workspace/` e cache de plugins |
+| `~/.zcode/zsync-projects.json` + acks de projetos (`cli/zsync-projects/`) | |
+| **Configs com merge inteligente** (0.11): `v2/setting.json`, `cli/config.json` (hooks/MCP), `v2/agents-state.json`, `v2/config.json`, `v2/provider_config.json` | |
 
-**Providers são por máquina:** `v2/config.json`, `v2/provider_config.json` e `v2/credentials.json` **não** sincronizam — a versão 0.6.x chegou a sincronizar os dois primeiros e isso sobrescreveu as regras de provider de uma ponta com as da outra (corrigido no 0.6.2). O motor, além disso, **recusa a escrever nesses caminhos** (defesa em profundidade) e coloca qualquer remoto "muito mais pobre" em quarentena em vez de aplicar (ver abaixo).
+## Merge inteligente das configs (0.11.0) — o "dif" do zsync
+
+O zsync tem **motor de merge próprio, estrutural, para JSON** — não usa git nem linhas: ele compara **chave a chave / campo a campo** com 3 vias (base, esta máquina, a outra) e decide o que junta:
+
+- Você editou aqui e a outra máquina editou lá (campos diferentes) → **os dois lados entram**.
+- Item adicionado numa máquina (provider, MCP server, hook, projeto) → aparece na outra.
+- Remoção de um lado respeitada quando o outro não mexeu; modificação vence remoção (nunca perde).
+- **Empate real** (mesmo campo mudado diferente nas duas): o valor **local** fica na máquina e o remoto vai para a cópia `.sync-conflict-` — nada silencioso, nada perdido, push não trava.
+- Arquivo "de instalação nova" (pobre) encontrando config rica → **o rico fica intacto** (o incidente do 0.6 vira não-evento; e a quarentena de rebaixamento segue como segunda barreira).
+
+Com isso, as configs voltam a sincronizar: `v2/setting.json` (projetos recentes das duas máquinas na sidebar), `cli/config.json` (hooks e MCP das duas pontas se unem, dedup por conteúdo), `v2/agents-state.json` e os **configs de provider** (`v2/config.json` + `v2/provider_config.json` — providers/regras das duas máquinas se unem; a seleção default de cada máquina só é trocada se a outra foi a única a mudá-la). Prefere configs por máquina? **Settings → plugin → Configurar → desligar "Sincronizar configurações"**.
 
 **Estado do plugin:** vive em `~/.zcode/cli/zsync/` (fora do diretório de dados do plugin, que o app apaga no uninstall). Na primeira execução após atualizar, o estado antigo é migrado sozinho; o login não é perdido.
 
@@ -53,6 +61,7 @@ Ao sincronizar:
 | Sync automático | ligado | sincroniza em segundo plano ao abrir/terminar tarefas |
 | Intervalo mínimo do auto-sync (s) | 15 | tempo mínimo entre syncs automáticos |
 | Status ao abrir a sessão | ligado | mostra no contexto da sessão se há conflitos ou mudanças pendentes |
+| Sincronizar configurações | ligado | configs (hooks/MCP, providers, setting.json) sincronizam com merge inteligente; desligue para ficarem por máquina |
 
 O status de sessão usa o `additionalContext` do hook `SessionStart`: quando há algo pendente, uma ou duas linhas entram no contexto (sem custo de modelo); quando está tudo em dia, nada é injetado.
 
@@ -139,7 +148,7 @@ Na primeira tela de login o Google mostra o aviso "app não verificado" — norm
 - O refresh token fica no **Keychain do macOS**; no Linux, num arquivo com permissão 0600 em `~/.zcode/cli/zsync/`.
 - Todas as chamadas vão por HTTPS para `accounts.google.com`, `oauth2.googleapis.com` e `www.googleapis.com`.
 - Whitelist com verificação de caminho: nada fora das pastas listadas é lido ou gravado.
-- **Chaves de API ficam em cada máquina** (configs de provider não viajam; o motor recusa escrever nelas). O que vai ao Drive é apenas o conteúdo listado na whitelist.
+- **Merge estrutural nunca gera JSON inválido** e nunca descarta lado: empates mantêm o valor local e preservam o remoto em cópia visível. Chaves de API nos configs de provider viajam apenas entre as SUAS máquinas, no Drive privado (para não sincronizá-las: desligue "Sincronizar configurações").
 - **Backup local antes de qualquer sobrescrita** (`~/.zcode/cli/zsync/backup/`, 5 gerações) e **quarentena de remoto mais pobre** — o incidente do 0.6.x tem três camadas de defesa agora.
 - **Os arquivos de sessão contêm o texto das conversas** (sem outputs de ferramenta por padrão) e viajam pelo mesmo Drive privado — o export local também fica 0600.
 - O `client_secret` de um OAuth client tipo Desktop não é tratado como confidencial pelo Google (apps instalados não conseguem guardar segredos — por isso apps como o WhatsApp embutem o próprio). Ainda assim, mantenha este repositório privado; o GitHub Push Protection pode bloquear o primeiro push por causa dele — use os links de "unblock" que o próprio GitHub oferece.

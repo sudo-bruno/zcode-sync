@@ -35,18 +35,8 @@ def zsync_root():
 
 
 def read_options(root):
-    """Opções do plugin declaradas em userConfig, mescladas entre marketplaces."""
-    try:
-        with open(os.path.join(root, "cli", "config.json"), "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-    except (OSError, ValueError):
-        return {}
-    opts = (cfg.get("plugins", {}) or {}).get("options", {}) or {}
-    merged = {}
-    for key in sorted(opts):
-        if key.startswith("zcode-sync@") and isinstance(opts[key], dict):
-            merged.update(opts[key])
-    return merged
+    """Opções userConfig do plugin — delega no motor (mesma leitura do sync)."""
+    return zsync.read_plugin_options(root)
 
 
 def data_dir():

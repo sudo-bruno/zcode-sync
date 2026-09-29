@@ -4,8 +4,8 @@
     {
       "name": "zcode-sync",
       "source": "./zcode-sync",
-      "version": "0.10.0",
-      "description": "Sincroniza skills, agents, commands, AGENTS.md, memórias, sessões (gzip enxuto) e o CÓDIGO dos projetos (bundles git pelo Drive, merge git nas duas pontas — edições dos dois lados se preservam); merge estilo git, hooks automáticos, comandos sem modelo; providers ficam por máquina.",
+      "version": "0.11.0",
+      "description": "Sincroniza skills, agents, commands, AGENTS.md, memórias, sessões (gzip enxuto), o CÓDIGO dos projetos (bundles git pelo Drive) e as CONFIGS com merge estrutural próprio do zsync (chave a chave: edições dos dois lados se preservam, empate fica com o local, remoto vai para cópia); hooks automáticos, comandos sem modelo.",
       "displayName": "ZCode Sync",
       "category": "utilities",
       "author": "Bruno Saraiva",

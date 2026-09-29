@@ -241,16 +241,20 @@ def integration():
         check("t10: m2 propaga o binário resolvido", r["ok"] and r["pushed"], str(r))
         lab.run("m1", "sync")
 
-        # t12 — configs de providers NÃO sincronizam (por máquina; incidente de overwrite 0.6.x)
-        lab.write("m1", "v2/config.json", '{"provider":{"x":{"options":{"apiKey":"m1"}}}}\n')
-        lab.write("m2", "v2/config.json", '{"provider":{"x":{"options":{"apiKey":"m2"}}}}\n')
-        lab.run("m1", "sync")
+        # t12 — configs sincronizam com MERGE ESTRUTURAL (0.11): união dos dois lados
+        lab.write("m1", "v2/config.json", json.dumps({"provider": {"mac": {"apiKey": "k1"}}}))
+        lab.write("m2", "v2/config.json", json.dumps({"provider": {"linux": {"apiKey": "k2"}}}))
+        r = lab.run("m1", "sync")
+        check("t12: m1 sobe sua config", r["ok"], str(r)[:200])
         r = lab.run("m2", "sync")
-        check("t12: config não sincroniza (cada máquina mantém a sua)",
-              lab.read("m2", "v2/config.json") == '{"provider":{"x":{"options":{"apiKey":"m2"}}}}\n',
-              repr(lab.read("m2", "v2/config.json")))
-        check("t12: config não entrou no remoto",
-              not any(e.get("path") == "v2/config.json" for e in r["events"]), str(r["events"])[:200])
+        check("t12: m2 une as duas configs (sem conflito manual)",
+              r["ok"] and json.loads(lab.read("m2", "v2/config.json")) ==
+              {"provider": {"mac": {"apiKey": "k1"}, "linux": {"apiKey": "k2"}}},
+              str(r)[:300] + " || " + lab.read("m2", "v2/config.json"))
+        r = lab.run("m1", "sync")
+        check("t12: m1 recebe a config da m2",
+              json.loads(lab.read("m1", "v2/config.json")) ==
+              {"provider": {"mac": {"apiKey": "k1"}, "linux": {"apiKey": "k2"}}}, str(r)[:200])
 
         # t13 — regressão: rebase + arquivo novo local (era falso modify/delete)
         lab.write("m1", "agents/novo-m1.md", "novo do m1\n")
@@ -333,21 +337,84 @@ def integration_p1():
               all("by" in v and "at" in v for v in manifest["files"].values()),
               str(manifest["files"])[:200])
 
-        # t17 — defesa: NEVER_SYNC nunca é escrito pelo motor
-        try:
-            ctx = zsync.Ctx(argparse.Namespace(root=lab.root("m1"), data=lab.data("m1"),
-                                               backend="file:" + lab.backend, device="m1",
-                                               compact=False))
-            ctx.sync_generation = "g-test"
-            ctx.write_local("v2/provider_config.json", b"{}")
-            check("t17: write_local recusa NEVER_SYNC", False, "não levantou")
-        except zsync.SyncError:
-            check("t17: write_local recusa NEVER_SYNC", True)
-        except Exception as ex:
-            check("t17: write_local recusa NEVER_SYNC", False, repr(ex))
+        # t17 — incidente do 0.6 vira NÃO-EVENTO: arquivo de instalação nova
+        # (pobre) criado nas duas pontas entra por MERGE — o rico fica intacto
+        rich = json.dumps({"schemaVersion": 1, "config": {
+            "providerOrder": ["a", "b"],
+            "providerConfigRules": [{"id": "r1"}, {"id": "r2"}],
+            "modelConfigRules": [{"id": "m1", "v": 1}],
+            "defaultModelSelection": {"provider": "a", "model": "x"}}})
+        poor = json.dumps({"schemaVersion": 1, "config": {
+            "providerConfigRules": [], "modelConfigRules": []}})
+        lab.write("m1", "v2/provider_config.json", rich)
+        r = lab.run("m1", "sync")
+        check("t17: m1 sobe provider rico", r["ok"], str(r)[:200])
+        lab.write("m2", "v2/provider_config.json", poor)  # instalação nova na m2
+        r = lab.run("m2", "sync")
+        merged = json.loads(lab.read("m2", "v2/provider_config.json"))
+        check("t17: merge estrutural preserva o rico na m2",
+              merged["config"]["providerOrder"] == ["a", "b"] and
+              len(merged["config"]["providerConfigRules"]) == 2 and
+              merged["config"]["modelConfigRules"][0]["v"] == 1, str(merged)[:200])
+        check("t17: sem conflito manual", r["ok"] and not r["conflicts"], str(r)[:200])
     finally:
         lab.cleanup()
 
+
+def unit_merge_json3():
+    """0.11.0 — merge estrutural de JSON (o 'dif inteligente' das configs)."""
+    def m(b, o, t):
+        return zsync.merge_json3(b, o, t)
+
+    # dict: adições dos dois lados se unem
+    v, c = m({}, {"a": 1}, {"b": 2})
+    check("mj: união de adições", v == {"a": 1, "b": 2} and not c, str(v))
+    # mudanças em chaves distintas
+    v, c = m({"a": 1, "b": 1}, {"a": 2, "b": 1}, {"a": 1, "b": 3})
+    check("mj: chaves distintas dos dois lados", v == {"a": 2, "b": 3} and not c, str(v))
+    # empate escalar: local vence, anotado
+    v, c = m({"m": 1}, {"m": 2}, {"m": 3})
+    check("mj: empate escalar → local + anotação", v == {"m": 2} and c, str((v, c)))
+    # mesma mudança dos dois lados
+    v, c = m({"x": 1}, {"x": 9}, {"x": 9})
+    check("mj: convergiu", v == {"x": 9} and not c, str(v))
+    # remoção de um lado respeitada se o outro não mexeu
+    v, c = m({"a": 1, "b": 2}, {"a": 1}, {"a": 1, "b": 2})
+    check("mj: remoção do local aplicada", v == {"a": 1} and not c, str(v))
+    v, c = m({"a": 1, "b": 2}, {"a": 1, "b": 2}, {"a": 1})
+    check("mj: remoção do remoto aplicada", v == {"a": 1} and not c, str(v))
+    # modificação aqui × remoção lá → mantém a modificação (nada se perde)
+    v, c = m({"a": 1}, {"a": 2}, {})
+    check("mj: modificação vence remoção", v == {"a": 2} and c, str((v, c)))
+    # dict aninhado: campos diferentes dos dois lados se juntam
+    v, c = m({"p": {"x": 1, "y": 2}}, {"p": {"x": 10, "y": 2}}, {"p": {"x": 1, "y": 20}})
+    check("mj: aninhado junta campos", v == {"p": {"x": 10, "y": 20}} and not c, str(v))
+    # lista com identidade: itens de ambos entram; ordem local primeiro
+    v, c = m([], [{"id": "a", "v": 1}], [{"id": "b", "v": 2}])
+    check("mj: lista união com identidade",
+          [i["id"] for i in v] == ["a", "b"] and not c, str(v))
+    # item modificado num lado, intocado no outro
+    v, c = m([{"id": "a", "v": 1}], [{"id": "a", "v": 9}], [{"id": "a", "v": 1}])
+    check("mj: item modificado do local", v == [{"id": "a", "v": 9}] and not c, str(v))
+    v, c = m([{"id": "a", "v": 1}], [{"id": "a", "v": 1}], [{"id": "a", "v": 7}])
+    check("mj: item modificado do remoto", v == [{"id": "a", "v": 7}] and not c, str(v))
+    # mesmo item com campos diferentes nos dois lados → junta campos
+    v, c = m([{"id": "a", "x": 1, "y": 1}], [{"id": "a", "x": 2, "y": 1}], [{"id": "a", "x": 1, "y": 3}])
+    check("mj: item com campos de ambos", v == [{"id": "a", "x": 2, "y": 3}] and not c, str(v))
+    # remoção de item do remoto respeitada
+    v, c = m([{"id": "a"}, {"id": "b"}], [{"id": "a"}, {"id": "b"}], [{"id": "a"}])
+    check("mj: item removido no remoto sai", v == [{"id": "a"}] and not c, str(v))
+    # add/add escalar diferente → local + anotação
+    v, c = m(None, 5, 7)
+    check("mj: add/add escalar → local", v == 5 and c, str((v, c)))
+    # add/add dict nos dois lados → união
+    v, c = m(None, {"a": 1}, {"b": 2})
+    check("mj: add/add dict → união", v == {"a": 1, "b": 2} and not c, str(v))
+    # try_merge_json: bytes → bytes; não-JSON → None
+    r = zsync._try_merge_json(b'{"a":1}', b'{"b":2}')
+    check("mj: _try_merge_json junta bytes", r is not None and json.loads(r[0]) == {"a": 1, "b": 2}, str(r))
+    check("mj: _try_merge_json recusa não-JSON",
+          zsync._try_merge_json(b"# md", b'{"a":1}') is None, "")
 
 def unit_p1():
     """0.7.0 — heurística de downgrade e migração de estado."""
@@ -473,7 +540,8 @@ def unit_p2():
         # status de sessão: conflito aparece no additionalContext; máquina em dia, não
         d = os.path.join(root, "cli", "zsync")
         os.makedirs(d)
-        lines = zsync.session_status_lines(root, d)
+        pristine = os.path.join(base, "pristine-zcode")  # sem nenhum arquivo do whitelist
+        lines = zsync.session_status_lines(pristine, d)
         check("status: máquina sem estado não emite linhas", lines == [], str(lines))
         zsync.write_json(os.path.join(d, zsync.CONFLICTS_FILE),
                          {"agents/a.md": {"kind": "content"}})
@@ -1095,6 +1163,7 @@ def unit_prune():
 
 def main():
     unit_merge3()
+    unit_merge_json3()
     unit_auth_fallback()
     unit_auto_sync()
     unit_prompt_hook()
