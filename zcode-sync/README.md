@@ -19,7 +19,9 @@ Plugin ZCode que sincroniza seus recursos entre máquinas usando o Google Drive 
 | `~/.zcode/cli/sessions-export/` (sessões em gzip — ver abaixo) | |
 | `~/.zcode/zsync-projects.json` (manifesto de projetos) | |
 
-**Providers são por máquina:** `v2/config.json`, `v2/provider_config.json` e `v2/credentials.json` **não** sincronizam — a versão 0.6.x chegou a sincronizar os dois primeiros e isso sobrescreveu as regras de provider de uma ponta com as da outra (corrigido no 0.6.2). Backups automáticos (`*.zsync-backup-<data>`, 0600) continuam como rede de segurança para esses arquivos.
+**Providers são por máquina:** `v2/config.json`, `v2/provider_config.json` e `v2/credentials.json` **não** sincronizam — a versão 0.6.x chegou a sincronizar os dois primeiros e isso sobrescreveu as regras de provider de uma ponta com as da outra (corrigido no 0.6.2). O motor, além disso, **recusa a escrever nesses caminhos** (defesa em profundidade) e coloca qualquer remoto "muito mais pobre" em quarentena em vez de aplicar (ver abaixo).
+
+**Estado do plugin:** vive em `~/.zcode/cli/zsync/` (fora do diretório de dados do plugin, que o app apaga no uninstall). Na primeira execução após atualizar, o estado antigo é migrado sozinho; o login não é perdido.
 
 Ignora `.DS_Store`, `__pycache__`, `*.pyc`, links simbólicos e as cópias `*.sync-conflict-*` (que são locais de cada máquina).
 
@@ -34,6 +36,25 @@ Ao sincronizar:
 3. Conflito real (mesma região alterada dos dois lados) → o arquivo local fica intacto e o lado remoto é salvo como `arquivo.sync-conflict-<máquina>-<data>`. O push fica bloqueado até você resolver — é a garantia de que nada é sobrescrito ou perdido sem decisão.
 4. Deleção × modificação também vira decisão sua, nunca perda.
 5. Antes de gravar o manifesto no Drive, ele é relido: se outra máquina subeu no meio do caminho, o sync refaz o merge (até 3 vezes) — mesmo espírito do `git push` rejeitado → pull de novo.
+
+## Blindagens anti-incidente (0.7+)
+
+- **Backup por geração**: todo arquivo que o sync for sobrescrever ou apagar é copiado antes para `~/.zcode/cli/zsync/backup/<geração>/<caminho>` — uma geração por sync, com as **5 mais recentes** retidas. Restaurar qualquer versão anterior é copiar de volta.
+- **Quarentena de rebaixamento**: se a versão remota de um arquivo é um JSON muito mais pobre que a local (menos da metade do conteúdo — o padrão de um estado de instalação nova, como no incidente do `provider_config`), ela **não é aplicada**: vira conflito com o lado remoto guardado em cópia, para você decidir com `/zsync:resolve`.
+- **Autoria no manifesto**: cada entrada registra **quem produziu** aquele conteúdo e quando (`by`/`at`) — um incidente futuro responde "quem escreveu o quê" em vez de virar mistério.
+- **Poda do Drive (0.9)**: blobs antigos sem uso são removidos automaticamente (1×/dia após o sync, apenas com mais de 14 dias e fora do manifesto vigente). `/zsync:prune` roda na mão; `--dry-run` só lista.
+
+## Opções do plugin (na interface)
+
+**Settings → Plugin Management → zcode-sync → Configurar** (sem console, sem arquivo de config):
+
+| Opção | Padrão | O que faz |
+|---|---|---|
+| Sync automático | ligado | sincroniza em segundo plano ao abrir/terminar tarefas |
+| Intervalo mínimo do auto-sync (s) | 15 | tempo mínimo entre syncs automáticos |
+| Status ao abrir a sessão | ligado | mostra no contexto da sessão se há conflitos ou mudanças pendentes |
+
+O status de sessão usa o `additionalContext` do hook `SessionStart`: quando há algo pendente, uma ou duas linhas entram no contexto (sem custo de modelo); quando está tudo em dia, nada é injetado.
 
 ## Instalação
 
@@ -55,6 +76,7 @@ Depois de instalar ou atualizar o plugin, **reinicie o ZCode uma vez** — os ho
 | `/zsync:resolve <caminho> keep-ours\|take-theirs\|delete` | Decide um conflito (sem argumentos: lista os pendentes) |
 | `/zsync:sessions [status\|export\|import]` | Sessões: estado, exportar agora, importar o que chegou |
 | `/zsync:projects [status\|scan\|clone\|pull]` | Projetos: lista sincronizada, remontar manifesto, clonar o que falta, puxar novidades |
+| `/zsync:prune` | Poda blobs antigos sem uso no Drive (automática 1×/dia; `--dry-run` lista) |
 | `/zsync:logout` | Revoga o token no Google e limpa o Keychain |
 
 Os comandos **não passam pelo modelo**: o corpo de cada um é um marcador (`zsync-cmd:…`); um hook de `UserPromptSubmit` intercepta antes da IA, roda o motor e devolve a saída na tela. Se os hooks do plugin estiverem desativados (ou falharem), os comandos caem no modo antigo — o modelo executa e resume; nada quebra.
@@ -65,7 +87,7 @@ O ZCode não observa as pastas de recursos (não existe watcher) — skills/agen
 
 ## Desligar o automático
 
-**Settings → Plugin Management → zcode-sync**: desative os hooks do plugin. Consequência: sem sync automático e os comandos `/zsync:*` voltam ao modo modelo (fallback embutido). Os comandos manuais continuam existindo.
+Preferencial: **Settings → Plugin Management → zcode-sync → Configurar → desligar "Sync automático"** (os comandos e o status da sessão continuam funcionando). Alternativa mais drástica: desativar os hooks do plugin — aí os comandos `/zsync:*` voltam ao modo modelo (fallback embutido). Os comandos manuais continuam existindo nos dois casos.
 
 ## Sessões (histórico de conversas)
 
@@ -109,11 +131,11 @@ Na primeira tela de login o Google mostra o aviso "app não verificado" — norm
 ## Segurança
 
 - Escopo OAuth **apenas** `drive.appdata` + `openid email`: o plugin não vê nenhum outro arquivo do seu Drive, e nenhum outro app vê os dados dele.
-- O refresh token fica no **Keychain do macOS**; no Linux, num arquivo com permissão 0600 no diretório de dados do plugin.
+- O refresh token fica no **Keychain do macOS**; no Linux, num arquivo com permissão 0600 em `~/.zcode/cli/zsync/`.
 - Todas as chamadas vão por HTTPS para `accounts.google.com`, `oauth2.googleapis.com` e `www.googleapis.com`.
 - Whitelist com verificação de caminho: nada fora das pastas listadas é lido ou gravado.
-- Whitelist com verificação de caminho: nada fora das pastas listadas é lido ou gravado.
-- **Chaves de API ficam em cada máquina** (configs de provider não viajam). O que vai ao Drive é apenas o conteúdo listado na whitelist.
+- **Chaves de API ficam em cada máquina** (configs de provider não viajam; o motor recusa escrever nelas). O que vai ao Drive é apenas o conteúdo listado na whitelist.
+- **Backup local antes de qualquer sobrescrita** (`~/.zcode/cli/zsync/backup/`, 5 gerações) e **quarentena de remoto mais pobre** — o incidente do 0.6.x tem três camadas de defesa agora.
 - **Os arquivos de sessão contêm o texto das conversas** (sem outputs de ferramenta por padrão) e viajam pelo mesmo Drive privado — o export local também fica 0600.
 - O `client_secret` de um OAuth client tipo Desktop não é tratado como confidencial pelo Google (apps instalados não conseguem guardar segredos — por isso apps como o WhatsApp embutem o próprio). Ainda assim, mantenha este repositório privado; o GitHub Push Protection pode bloquear o primeiro push por causa dele — use os links de "unblock" que o próprio GitHub oferece.
 
@@ -124,7 +146,8 @@ Na primeira tela de login o Google mostra o aviso "app não verificado" — norm
 - **Duas máquinas sincronizando exatamente ao mesmo tempo**: o controle otimista faz uma delas refazer o merge automaticamente; no pior caso o sync pede para tentar de novo em instantes.
 - **Memórias**: o sync assume o mesmo layout de workspace nas máquinas (o caminho de memórias é derivado do workspace). Se na segunda máquina o hash do diretório de memórias for diferente, os arquivos chegam mas o agente local não os carrega.
 - **Comandos sem modelo**: a saída aparece como uma resposta sem custo de tokens; pode surgir um aviso cosmético `hooks_prompt_block` — é esperado.
-- **Backups de config** (`*.zsync-backup-*`) ficam só na máquina e são podados para os 5 mais recentes por arquivo; eles nunca entram no sync.
+- **Backups de geração** ficam só na máquina (`~/.zcode/cli/zsync/backup/`, 5 gerações) e nunca entram no sync.
+- **Poda do Drive**: só remove blob sem uso no manifesto vigente **e** com mais de 14 dias — uma máquina fora de ação por semanas não quebra; o manifesto vigente nunca é podado.
 
 ## Desenvolvimento
 

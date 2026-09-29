@@ -935,6 +935,43 @@ def unit_projects():
         shutil.rmtree(base, ignore_errors=True)
 
 
+def unit_prune():
+    """0.9.0 — poda: apaga só blob não referenciado pelo manifesto e fora da janela."""
+    lab = Lab()
+    try:
+        lab.write("m1", "skills/demo/SKILL.md", "# v1\n")
+        lab.run("m1", "sync")
+        lab.write("m1", "skills/demo/SKILL.md", "# v2\n")
+        lab.run("m1", "sync")   # blob do v1 fica órfão
+        objs = os.path.join(lab.backend, "objects")
+        old = time.time() - 40 * 86400
+        for name in os.listdir(objs):
+            os.utime(os.path.join(objs, name), (old, old))
+        r = lab.run("m1", "prune")
+        check("prune: blob órfão velho apagado", r["ok"] and r.get("deleted") == 1, str(r))
+        check("prune: blob referenciado permanece",
+              len(os.listdir(objs)) == 1, str(os.listdir(objs)))
+        for name in os.listdir(objs):
+            os.utime(os.path.join(objs, name))  # volta ao presente (referenciado)
+
+        # blob órfão RECENTE não pode ser apagado (janela de retenção):
+        # v3 cria um novo blob e torna o v2 órfão, mas com mtime recente
+        lab.write("m1", "skills/demo/SKILL.md", "# v3\n")
+        lab.run("m1", "sync")
+        r = lab.run("m1", "prune")
+        check("prune: blob recente é retido", r["ok"] and r.get("deleted") == 0, str(r))
+
+        # dry-run lista sem apagar (órfão agora envelhecido)
+        for name in os.listdir(objs):
+            os.utime(os.path.join(objs, name), (old, old))
+        r = lab.run("m1", "prune", ["--dry-run"])
+        check("prune: dry-run lista sem apagar",
+              r["ok"] and r.get("deleted") == 0 and r.get("candidates", 0) == 1 and
+              len(os.listdir(objs)) == 2, str(r))
+    finally:
+        lab.cleanup()
+
+
 def main():
     unit_merge3()
     unit_auth_fallback()
@@ -945,6 +982,7 @@ def main():
     unit_projects()
     unit_p1()
     unit_p2()
+    unit_prune()
     integration()
     integration_p1()
     print("")

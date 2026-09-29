@@ -74,8 +74,8 @@ def main():
             if len(sub) > 1 or (sub and sub[0] not in ("status", "scan", "clone", "pull")):
                 return finish("Uso: /zsync:projects [status|scan|clone|pull]", 2)
             argv = ["projects", sub[0] if sub else "status"]
-        elif action in ("status", "login", "logout"):
-            argv = [action]
+        elif action in ("status", "login", "logout", "prune"):
+            argv = [action] if action != "prune" else ["--compact", "prune"]
         else:
             return finish("", 0)  # marcador desconhecido: deixa passar
         finish(run_engine(argv), 2)

@@ -4,10 +4,17 @@
     {
       "name": "zcode-sync",
       "source": "./zcode-sync",
-      "version": "0.8.0",
-      "description": "Sincroniza skills, agents, commands, AGENTS.md, memórias, sessões (gzip enxuto) e projetos (git clone/pull) entre máquinas via Google Drive; merge estilo git, hooks automáticos, comandos sem modelo; providers ficam por máquina. 0.8: opções na UI (sync automático, intervalo, status da sessão), status no SessionStart e Stop assíncrono.",
+      "version": "0.9.0",
+      "description": "Sincroniza skills, agents, commands, AGENTS.md, memórias, sessões (gzip enxuto) e projetos (git clone/pull) entre máquinas via Google Drive; merge estilo git, hooks automáticos, comandos sem modelo; providers ficam por máquina. Backup por geração, quarentena de remoto pobre e poda automática do Drive.",
       "displayName": "ZCode Sync",
-      "category": "utilities"
+      "category": "utilities",
+      "author": "Bruno Saraiva",
+      "homepage": "https://github.com/sudo-bruno/zcode-sync",
+      "examplePrompts": [
+        "/zsync:status",
+        "/zsync:sync",
+        "/zsync:projects clone --into ~/Projetos"
+      ]
     }
   ]
 }

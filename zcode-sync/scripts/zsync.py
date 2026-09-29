@@ -31,7 +31,7 @@ import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-VERSION = "0.7.0"
+VERSION = "0.9.0"
 
 OAUTH_AUTH = "https://accounts.google.com/o/oauth2/v2/auth"
 OAUTH_TOKEN = "https://oauth2.googleapis.com/token"
@@ -317,6 +317,22 @@ class FileBackend:
         with open(os.path.join(self.root, "objects", sha), "rb") as f:
             return f.read()
 
+    def list_objects(self):
+        out = {}
+        objdir = os.path.join(self.root, "objects")
+        for name in os.listdir(objdir):
+            p = os.path.join(objdir, name)
+            if os.path.isfile(p):
+                out["objects/" + name] = os.path.getmtime(p)
+        return out
+
+    def delete_object(self, name):
+        p = os.path.join(self.root, name)
+        if os.path.isfile(p):
+            os.remove(p)
+            return True
+        return False
+
 
 class DriveBackend:
     """Google Drive API v3, pasta oculta appDataFolder."""
@@ -327,6 +343,7 @@ class DriveBackend:
     def __init__(self, tokens):
         self.tokens = tokens  # objeto Auth com get_access()
         self._ids = {}
+        self._created = {}
         self._listed_all = False
 
     def _req(self, method, url, data=None, headers=None, retries=5):
@@ -365,17 +382,38 @@ class DriveBackend:
         page_token = ""
         while True:
             q = {"spaces": "appDataFolder", "pageSize": 1000,
-                 "fields": "nextPageToken,files(id,name)"}
+                 "fields": "nextPageToken,files(id,name,createdTime)"}
             if page_token:
                 q["pageToken"] = page_token
             body = self._req("GET", DRIVE_API + "/files?" + urllib.parse.urlencode(q))
             page = json.loads(body)
             for f in page.get("files", []):
                 self._ids[f["name"]] = f["id"]
+                self._created[f["name"]] = f.get("createdTime", "")
             page_token = page.get("nextPageToken")
             if not page_token:
                 break
         self._listed_all = True
+
+    def list_objects(self):
+        """{nome: epoch_de_criação} de tudo no appDataFolder (listagem fresca)."""
+        self._ids = {}
+        self._created = {}
+        self._listed_all = False
+        self._list_all()
+        out = {}
+        for name, created in self._created.items():
+            out[name] = _rfc3339_to_epoch(created)
+        return out
+
+    def delete_object(self, name):
+        fid = self._file_id(name)
+        if not fid:
+            return False
+        self._req("DELETE", DRIVE_API + "/files/%s" % fid)
+        self._ids.pop(name, None)
+        self._created.pop(name, None)
+        return True
 
     def _file_id(self, name):
         if name in self._ids:
@@ -569,6 +607,69 @@ def id_token_email(id_token):
         return json.loads(base64.urlsafe_b64decode(payload)).get("email", "")
     except Exception:
         return ""
+
+
+def _rfc3339_to_epoch(text):
+    """createdTime do Drive (RFC3339) → epoch; 0 se ilegível (nunca podar)."""
+    if not text:
+        return 0.0
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+# Poda de blobs (0.9.0): só apaga blob NÃO referenciado pelo manifesto remoto
+# atual e mais velho que a janela de retenção — blob só é baixado a partir do
+# manifesto vigente, então nada que outra máquina precise pode ser podado.
+PRUNE_MIN_AGE_DAYS = 14
+PRUNE_INTERVAL = 24 * 3600
+
+
+def cmd_prune(ctx, args_json, days=None, dry_run=False):
+    backend = get_backend(ctx)
+    if dry_run:
+        deleted, kept, candidates = 0, 0, _prune_candidates(ctx, backend, days)
+        lines = ["Poda (simulação): %d blob(s) seria(m) apagado(s) do %s." %
+                 (len(candidates), backend.kind)]
+        for name in candidates[:15]:
+            lines.append("  %s" % name)
+        if len(candidates) > 15:
+            lines.append("  … (+%d)" % (len(candidates) - 15))
+        if not candidates:
+            lines.append("Nada a podar: todos os blobs estão em uso ou dentro da janela.")
+        return out(args_json, ok=True, lines=lines, deleted=0, candidates=len(candidates))
+    deleted, kept = _prune_apply(ctx, backend, days)
+    lines = ["Poda concluída: %d blob(s) antigo(s) apagado(s), %d em uso/retidos (%s)." %
+             (deleted, kept, backend.kind)]
+    return out(args_json, ok=True, lines=lines, deleted=deleted, kept=kept)
+
+
+def _prune_candidates(ctx, backend, days):
+    remote = backend.get_manifest()
+    referenced = {"manifest.json"}
+    for e in (remote or {}).get("files", {}).values():
+        referenced.add("objects/" + e.get("sha256", ""))
+    cutoff = time.time() - max(0, days if days is not None else PRUNE_MIN_AGE_DAYS) * 86400
+    candidates = []
+    for name, created in backend.list_objects().items():
+        if name in referenced or created == 0 or created > cutoff:
+            continue
+        candidates.append(name)
+    return sorted(candidates)
+
+
+def _prune_apply(ctx, backend, days):
+    candidates = _prune_candidates(ctx, backend, days)
+    deleted = 0
+    for name in candidates:
+        try:
+            if backend.delete_object(name):
+                deleted += 1
+        except SyncError:
+            continue
+    kept = len(backend.list_objects())
+    return deleted, kept
 
 
 def cmd_login(auth, args_json):
@@ -1265,6 +1366,10 @@ def cmd_sync(ctx, args_json, args=None):
                     lines = pre + [""] + lines
                 if not report.events:
                     lines.append("Nada a fazer: máquina já em dia com o remoto.")
+                if pushed:
+                    note = maybe_auto_prune(ctx)
+                    if note:
+                        lines.append(note)
                 return out(args_json, ok=True, lines=lines,
                            events=report.events, pushed=pushed,
                            conflicts=ctx.conflicts())
@@ -1278,6 +1383,29 @@ def cmd_sync(ctx, args_json, args=None):
         raise SyncError("falha inesperada no sync: %r" % e)
     finally:
         release_lock(lock)
+
+
+def maybe_auto_prune(ctx):
+    """Poda automática após push bem-sucedido: no máximo 1×/dia, só no Drive.
+    Retorna linha de aviso ou None. Silenciosa em qualquer falha."""
+    try:
+        backend = get_backend(ctx)
+        if backend.kind != "drive":
+            return None
+        marker = os.path.join(ctx.data_dir, ".last-prune")
+        try:
+            if time.time() - os.path.getmtime(marker) < PRUNE_INTERVAL:
+                return None
+        except OSError:
+            pass
+        open(marker, "w").close()
+        deleted, _kept = _prune_apply(ctx, backend, None)
+        if deleted:
+            return "poda: %d blob(s) antigo(s) sem uso removido(s) do Drive (retenção de %d dias)." % (
+                deleted, PRUNE_MIN_AGE_DAYS)
+    except (SyncError, OSError):
+        return None
+    return None
 
 
 def session_status_lines(root, data_dir=None):
@@ -1505,6 +1633,10 @@ def main(argv):
     rp = sub.add_parser("resolve")
     rp.add_argument("--path", required=True)
     rp.add_argument("--choice", required=True, choices=["keep-ours", "take-theirs", "delete"])
+    prune_p = sub.add_parser("prune")
+    prune_p.add_argument("--days", type=int, default=None,
+                         help="janela de retenção em dias (padrão %d)" % PRUNE_MIN_AGE_DAYS)
+    prune_p.add_argument("--dry-run", action="store_true", help="só lista o que seria apagado")
     args = ap.parse_args(argv)
 
     ctx = Ctx(args)
@@ -1526,6 +1658,8 @@ def main(argv):
             return cmd_conflicts(ctx, args.json)
         if args.cmd == "resolve":
             return cmd_resolve(ctx, args.json, args.path, args.choice)
+        if args.cmd == "prune":
+            return cmd_prune(ctx, args.json, days=args.days, dry_run=args.dry_run)
     except SyncError as e:
         return out(args.json, ok=False, lines=["Erro: %s" % e])
     return 2
