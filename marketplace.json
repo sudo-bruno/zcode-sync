@@ -4,8 +4,8 @@
     {
       "name": "zcode-sync",
       "source": "./zcode-sync",
-      "version": "0.12.0",
-      "description": "Sincroniza skills, agents, commands, AGENTS.md, memórias, o BANCO de sessões inteiro (comprimido, diff por linha na outra ponta), o CÓDIGO dos projetos (bundles git pelo Drive) e as CONFIGS com merge estrutural próprio do zsync; hooks automáticos, comandos sem modelo.",
+      "version": "0.13.0",
+      "description": "Sync completo entre máquinas SEM comandos: ao abrir/fechar tarefas o plugin sincroniza arquivos, configs (merge estrutural), código dos projetos (bundles git), clona o que falta e aplica o diff do banco inteiro. Um clique em /zsync:tudo força tudo agora. Google Drive privado; providers com merge por campo.",
       "displayName": "ZCode Sync",
       "category": "utilities",
       "author": "Bruno Saraiva",

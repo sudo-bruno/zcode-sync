@@ -81,6 +81,8 @@ LOCK_FILE = "lock"
 # o app apaga cli/plugins/data/<plugin> no uninstall (update preserva), e perder
 # o "base" transformaria o próximo sync num first-sync barulhento.
 STATE_DIR_NAME = os.path.join("cli", "zsync")
+RESOURCE_PREFIXES = ("skills/", "agents/", "commands/", "cli/memories/", "AGENTS.md",
+                     "v2/agents-state.json")
 STATE_MIGRATE_FILES = (STATE_FILE, CONFLICTS_FILE, "device.json", "access.json",
                        "auth.json", "auto-sync.log", ".last-auto-sync")
 # Gerações de backup retidas em <estado>/backup/<geração>/ (uma por sync que
@@ -1676,6 +1678,36 @@ def cmd_sync(ctx, args_json, args=None):
                             lines += [""] + m["lines"]
                     except Exception as e:
                         lines.append("aviso: merge do banco falhou: %r" % e)
+                # 0.13.0 — ZERO COMANDOS: clona projetos que faltam na pasta
+                # configurada (opção projectsDir) e importa sessões novas
+                # automaticamente — o sync sozinho deixa a máquina completa.
+                try:
+                    pdir = read_plugin_options(ctx.root).get("projectsDir")
+                    if pdir:
+                        cl = _sibling("projects").clone(ctx.root, ctx.data_dir,
+                                                        get_backend(ctx), ctx.device,
+                                                        into=os.path.expanduser(pdir))
+                        cl_lines = [l for l in cl["lines"] if "nada a clonar" not in l]
+                        if cl_lines:
+                            lines += [""] + cl_lines
+                except Exception as e:
+                    lines.append("aviso: clone automático de projetos falhou: %r" % e)
+                try:
+                    si = _sibling("sessions").import_sessions(ctx.root, ctx.data_dir, backup=True)
+                    si_lines = [l for l in si["lines"] if "nada para importar" not in l
+                                and not l.startswith("%d sessão(ões) importada(s) não re-exportada(s)" % 0)]
+                    if si_lines and "nenhum arquivo" not in si_lines[0]:
+                        lines += si_lines
+                except Exception as e:
+                    lines.append("aviso: import de sessões falhou: %r" % e)
+                # sync trouxe recursos (skills/agents/commands/memórias)? avisa para recarregar
+                n_res = sum(1 for e in report.events
+                            if e["type"] in ("baixado", "mesclado", "removido-local")
+                            and e["path"].startswith(RESOURCE_PREFIXES))
+                if n_res:
+                    st_now = ctx.state() or {}
+                    st_now["needs_reload"] = n_res
+                    write_json(ctx.state_path, st_now)
                 return out(args_json, ok=True, lines=lines,
                            events=report.events, pushed=pushed,
                            conflicts=ctx.conflicts())
@@ -1733,6 +1765,14 @@ def session_status_lines(root, data_dir=None):
         changed = -1
     if changed > 0:
         lines.append("zcode-sync: %d arquivo(s) com mudança local ainda não sincronizada (o auto-sync em segundo plano cuida disso)." % changed)
+    if state.get("needs_reload"):
+        lines.append("zcode-sync: o sync trouxe %d recurso(s) novo(s)/alterado(s) — abra uma tarefa nova ou clique em 'Reload session' no topo para carregar." % state["needs_reload"])
+        try:
+            st_now = dict(state)
+            st_now.pop("needs_reload")
+            write_json(os.path.join(data_dir, STATE_FILE), st_now)
+        except OSError:
+            pass
     if lines and state.get("last_remote_version"):
         lines.append("zcode-sync: último ponto comum v%s (%s)." % (state["last_remote_version"], state.get("updated", "?")))
     return lines

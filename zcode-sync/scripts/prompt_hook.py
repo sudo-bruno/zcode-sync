@@ -62,7 +62,7 @@ def main():
                 argv = ["resolve", "--path", parts[0], "--choice", parts[1]]
             else:
                 return finish(USAGE, 2)
-        elif action == "sync":
+        elif action in ("sync", "tudo"):
             argv = ["--compact", "sync", "--export-sessions", "--pull-projects"]
         elif action == "sessions":
             sub = raw_args.split()

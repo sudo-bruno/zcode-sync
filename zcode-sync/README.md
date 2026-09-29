@@ -91,6 +91,12 @@ Depois de instalar ou atualizar o plugin, **reinicie o ZCode uma vez** — os ho
 
 Os comandos **não passam pelo modelo**: o corpo de cada um é um marcador (`zsync-cmd:…`); um hook de `UserPromptSubmit` intercepta antes da IA, roda o motor e devolve a saída na tela. Se os hooks do plugin estiverem desativados (ou falharem), os comandos caem no modo antigo — o modelo executa e resume; nada quebra.
 
+## Zero comandos (e o "um clique")
+
+**No dia a dia você não roda nada**: abrir o ZCode (SessionStart) e terminar tarefas (Stop) disparam o pipeline completo — sync de arquivos/configs com merge inteligente, código dos projetos (checkpoint → bundle → merge), clonagem automática de projeto que falta na **pasta configurada** (opção "Pasta dos projetos"), snapshot do banco e diff por linha das outras máquinas. Quando o sync traz skills/agents/commands novos, o ZCode avisa no contexto da próxima sessão: *"abra tarefa nova ou clique em Reload session"* — é o app que exige isso para recarregar recursos (não existe rescan automático no 3.14.3).
+
+**Quando quiser forçar tudo agora: um clique.** Digite `/` no campo de mensagem e clique em **zsync:tudo** na lista de comandos — o hook executa o pipeline completo sem passar pelo modelo (zero tokens). Plugins não podem adicionar botões na interface do ZCode (verificado no código-fonte 3.14.3: os únicos componentes de plugin são comando/skill/agente/hook/MCP) — o comando clicável no menu `/` é o "botão" que o app oferece. Atualizar o plugin continua sendo 3 cliques na UI (mercado → atualizar → reiniciar), pois é o app que gerencia isso.
+
 ## Recém-sincronizado só aparece em tarefa nova
 
 O ZCode não observa as pastas de recursos (não existe watcher) — skills/agents/commands sincronizados com o app aberto aparecem quando você **abre uma tarefa nova** ou usa o botão **Reload session** no header da sessão. Reiniciar o app é o garantido. Como o sync automático roda no início da sessão, o fluxo normal é: outra máquina subeu mudanças → abra uma tarefa nova → está tudo lá.

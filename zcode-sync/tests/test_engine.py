@@ -1284,6 +1284,71 @@ def unit_db_sync():
         shutil.rmtree(base, ignore_errors=True)
 
 
+def unit_zero_commands():
+    """0.13.0 — auto-clone pela opção projectsDir + aviso de reload + /zsync:tudo."""
+    lab = Lab()
+    try:
+        # m1 compartilha um projeto; m2 NÃO tem a pasta configurada ainda
+        proj1 = os.path.join(lab.base, "m1code", "projz")
+        os.makedirs(proj1)
+        subprocess.run(["git", "init", "-q", "-b", "main", proj1], check=True)
+        subprocess.run(["git", "-C", proj1, "config", "user.name", "t"], check=True)
+        subprocess.run(["git", "-C", proj1, "config", "user.email", "t@t"], check=True)
+        with open(os.path.join(proj1, "c.txt"), "w") as f:
+            f.write("v1\n")
+        subprocess.run(["git", "-C", proj1, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", proj1, "commit", "-qm", "c1"], check=True)
+        os.makedirs(os.path.join(lab.root("m1"), "v2"))
+        with open(os.path.join(lab.root("m1"), "v2", "setting.json"), "w") as f:
+            json.dump({"recentProjects": [proj1]}, f)
+        lab.run("m1", "projects", ["scan"])
+        r = lab.run("m1", "sync", ["--export-sessions", "--pull-projects"])
+        check("z: m1 publica projeto", r["ok"], str(r)[:300])
+
+        # m2 com projectsDir configurado: o SYNC sozinho clona o que falta
+        os.makedirs(os.path.join(lab.root("m2"), "cli"), exist_ok=True)
+        with open(os.path.join(lab.root("m2"), "cli", "config.json"), "w") as f:
+            json.dump({"plugins": {"options": {"zcode-sync@dev-default-zsync": {
+                "projectsDir": os.path.join(lab.base, "m2code")}}}}, f)
+        lab.run("m2", "sync")
+        r = lab.run("m2", "sync", ["--export-sessions", "--pull-projects"])
+        dest = os.path.join(lab.base, "m2code", "projz")
+        check("z: sync clonou o projeto sozinho na pasta configurada",
+              os.path.isdir(os.path.join(dest, ".git")) and
+              open(os.path.join(dest, "c.txt")).read() == "v1\n", str(r)[:400])
+
+        # sync trouxe recursos → state marca needs_reload; status de sessão emite e limpa
+        lab.write("m1", "skills/nova/SKILL.md", "# novo\n")
+        r = lab.run("m1", "sync", ["--export-sessions", "--pull-projects"])
+        r = lab.run("m2", "sync", ["--export-sessions", "--pull-projects"])
+        st = zsync.read_json(os.path.join(lab.data("m2"), zsync.STATE_FILE), {})
+        check("z: needs_reload marcado após receber recurso",
+              isinstance(st.get("needs_reload"), int) and st["needs_reload"] >= 1, str(st)[:200])
+        lines = zsync.session_status_lines(lab.root("m2"), lab.data("m2"))
+        check("z: status de sessão pede reload", any("Reload session" in l for l in lines), str(lines))
+        st = zsync.read_json(os.path.join(lab.data("m2"), zsync.STATE_FILE), {})
+        check("z: aviso limpo após emitido (nova tarefa já recarregou)", "needs_reload" not in st, str(st)[:150])
+
+        # /zsync:tudo é aceito pelo hook (alias do pipeline completo)
+        tmp = tempfile.mkdtemp(prefix="zsync-tudo-")
+        try:
+            engine = os.path.join(tmp, "fake_engine.py")
+            with open(engine, "w") as f:
+                f.write("import sys\nprint('ENGINE', ' '.join(sys.argv[1:]))\n")
+            hook = os.path.join(HERE, "..", "scripts", "prompt_hook.py")
+            r = subprocess.run([sys.executable, hook],
+                               input=json.dumps({"prompt": "zsync-cmd:tudo"}),
+                               capture_output=True, text=True,
+                               env=dict(os.environ, ZSYNC_ENGINE=engine), timeout=30)
+            check("z: /zsync:tudo roda o pipeline completo (exit 2)",
+                  r.returncode == 2 and "--compact sync --export-sessions --pull-projects" in r.stderr,
+                  r.stderr[:200])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        lab.cleanup()
+
+
 def main():
     unit_merge3()
     unit_merge_json3()
@@ -1297,6 +1362,7 @@ def main():
     unit_p2()
     unit_prune()
     unit_db_sync()
+    unit_zero_commands()
     integration()
     integration_p1()
     print("")
