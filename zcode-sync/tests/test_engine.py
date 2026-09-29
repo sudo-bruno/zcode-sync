@@ -420,15 +420,22 @@ def unit_auth_fallback():
 
 
 def unit_auto_sync():
-    """auto_sync: dispara detached, grava marker+log, respeita throttle."""
+    """auto_sync: dispara detached, grava marker+log, respeita throttle.
+
+    ZSYNC_ZSYNC_GCP aponta para arquivo inexistente para o sync spawnado falhar
+    rápido SEM tocar em rede/estado reais (o teste é de disparo, não de sync)."""
     env = dict(os.environ)
     dd = tempfile.mkdtemp(prefix="zsync-auto-")
+    fake_root = os.path.join(dd, "fake-zcode")
+    os.makedirs(fake_root)
     env["ZSYNC_STATE_DIR"] = dd
-    env.pop("ZCODE_ZSYNC_GCP", None)
+    env["ZSYNC_ROOT"] = fake_root
+    env["ZSYNC_ZSYNC_GCP"] = os.path.join(dd, "sem-gcp.json")
     try:
         r = subprocess.run([sys.executable, os.path.join(HERE, "..", "scripts", "auto_sync.py"), "start"],
                            capture_output=True, text=True, env=env, timeout=15)
         check("auto: exit 0", r.returncode == 0, r.stderr[:200])
+        check("auto: stdout vazio quando nada a relatar", not r.stdout.strip(), r.stdout[:200])
         check("auto: marker criado", os.path.exists(os.path.join(dd, ".last-auto-sync")))
         with open(os.path.join(dd, "auto-sync.log")) as f:
             content = f.read()
@@ -440,6 +447,87 @@ def unit_auto_sync():
         check("auto: throttle segura 2º disparo", r2.returncode == 0 and len(lines) == 1)
     finally:
         shutil.rmtree(dd, ignore_errors=True)
+
+
+def unit_p2():
+    """0.8.0 — opções userConfig e status no SessionStart."""
+    # read_options: mescla opções de qualquer marketplace zcode-sync@*
+    base = tempfile.mkdtemp(prefix="zsync-opts-")
+    try:
+        root = os.path.join(base, ".zcode")
+        os.makedirs(os.path.join(root, "cli"))
+        with open(os.path.join(root, "cli", "config.json"), "w") as f:
+            json.dump({"plugins": {"options": {
+                "zcode-sync@dev-default-zsync": {"autoSync": False, "autoSyncInterval": 60},
+                "zcode-sync@gh-bruno": {"autoSyncInterval": 30},
+                "outro-plugin@x": {"autoSyncInterval": 1},
+            }}}, f)
+        opts = None
+        sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
+        import auto_sync  # noqa: E402
+        merged = auto_sync.read_options(root)
+        check("opções: mescla marketplaces e ignora outros plugins",
+              merged.get("autoSync") is False and merged.get("autoSyncInterval") == 30, str(merged))
+        check("opções: config ausente → {}", auto_sync.read_options(os.path.join(base, "vazio")) == {})
+
+        # status de sessão: conflito aparece no additionalContext; máquina em dia, não
+        d = os.path.join(root, "cli", "zsync")
+        os.makedirs(d)
+        lines = zsync.session_status_lines(root, d)
+        check("status: máquina sem estado não emite linhas", lines == [], str(lines))
+        zsync.write_json(os.path.join(d, zsync.CONFLICTS_FILE),
+                         {"agents/a.md": {"kind": "content"}})
+        zsync.write_json(os.path.join(d, zsync.STATE_FILE),
+                         {"last_remote_version": 3, "updated": "t", "base": {}})
+        lab_root = os.path.join(root, "skills", "demo")
+        os.makedirs(lab_root)
+        with open(os.path.join(lab_root, "SKILL.md"), "w") as f:
+            f.write("x\n")
+        lines = zsync.session_status_lines(root, d)
+        check("status: conflito e pendência aparecem",
+              any("conflito" in l for l in lines) and any("não sincronizada" in l for l in lines),
+              str(lines))
+        check("status: menciona último ponto comum", any("v3" in l for l in lines), str(lines))
+
+        # hook SessionStart de ponta a ponta: stdout JSON com additionalContext
+        env = dict(os.environ, ZSYNC_STATE_DIR=d, ZSYNC_ROOT=root,
+                   ZSYNC_ZSYNC_GCP=os.path.join(base, "sem-gcp.json"))
+        r = subprocess.run([sys.executable, os.path.join(HERE, "..", "scripts", "auto_sync.py"), "start"],
+                           capture_output=True, text=True, env=env, timeout=15)
+        payload = {}
+        try:
+            payload = json.loads(r.stdout.strip().splitlines()[-1])
+        except Exception:
+            pass
+        check("hook: SessionStart emite JSON additionalContext",
+              "conflito" in payload.get("additionalContext", ""), r.stdout[:200])
+        check("hook: exit 0 (não bloqueia)", r.returncode == 0, str(r.returncode))
+
+        # autoSync=false: sem spawn (mas status continua — opção independente)
+        with open(os.path.join(root, "cli", "config.json"), "w") as f:
+            json.dump({"plugins": {"options": {"zcode-sync@dev-default-zsync": {"autoSync": False}}}}, f)
+        d2 = os.path.join(base, "estado2")
+        os.makedirs(d2)
+        zsync.write_json(os.path.join(d2, zsync.CONFLICTS_FILE), {"a": {"kind": "content"}})
+        env2 = dict(os.environ, ZSYNC_STATE_DIR=d2, ZSYNC_ROOT=root,
+                    ZSYNC_ZSYNC_GCP=os.path.join(base, "sem-gcp.json"))
+        r = subprocess.run([sys.executable, os.path.join(HERE, "..", "scripts", "auto_sync.py"), "start"],
+                           capture_output=True, text=True, env=env2, timeout=15)
+        check("opções: autoSync=false mantém status mas não dispara sync",
+              r.returncode == 0 and "conflito" in r.stdout and
+              not os.path.exists(os.path.join(d2, ".last-auto-sync")), r.stdout[:200])
+
+        # sessionStatus=false: silencia o status (e ainda dispara o sync)
+        with open(os.path.join(root, "cli", "config.json"), "w") as f:
+            json.dump({"plugins": {"options": {"zcode-sync@dev-default-zsync": {"sessionStatus": False}}}}, f)
+        r = subprocess.run([sys.executable, os.path.join(HERE, "..", "scripts", "auto_sync.py"), "start"],
+                           capture_output=True, text=True, env=env2, timeout=15)
+        marker = os.path.exists(os.path.join(d2, ".last-auto-sync"))
+        check("opções: sessionStatus=false silencia status e mantém sync",
+              r.returncode == 0 and not r.stdout.strip() and marker, r.stdout[:200])
+    finally:
+        sys.path = [p for p in sys.path if not p.endswith(os.path.join(HERE, "..", "scripts"))] or sys.path
+        shutil.rmtree(base, ignore_errors=True)
 
 
 def unit_prompt_hook():
@@ -856,6 +944,7 @@ def main():
     unit_sessions()
     unit_projects()
     unit_p1()
+    unit_p2()
     integration()
     integration_p1()
     print("")

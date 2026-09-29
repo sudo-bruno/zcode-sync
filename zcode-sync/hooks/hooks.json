@@ -19,6 +19,7 @@
           {
             "type": "command",
             "command": "python3 \"${ZCODE_PLUGIN_ROOT}/scripts/auto_sync.py\" stop",
+            "async": true,
             "timeout": 10,
             "statusMessage": "zcode-sync: push em segundo plano"
           }

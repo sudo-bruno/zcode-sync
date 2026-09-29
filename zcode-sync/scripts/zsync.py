@@ -1280,6 +1280,30 @@ def cmd_sync(ctx, args_json, args=None):
         release_lock(lock)
 
 
+def session_status_lines(root, data_dir=None):
+    """Status local rápido (sem rede) para o additionalContext do SessionStart.
+    Só tem algo a dizer quando há conflito ou mudança local pendente —
+    sessão em dia não recebe ruído no contexto."""
+    data_dir = data_dir or resolve_state_dir(root)
+    state = read_json(os.path.join(data_dir, STATE_FILE)) or {}
+    pending = read_json(os.path.join(data_dir, CONFLICTS_FILE), {}) or {}
+    lines = []
+    if pending:
+        lines.append("zcode-sync: %d conflito(s) pendente(s) — rode /zsync:conflicts e resolva antes de sincronizar." % len(pending))
+    try:
+        local = scan(root)
+        base = state.get("base") or {}
+        changed = sum(1 for p in set(local) | set(base)
+                      if local.get(p, {}).get("sha256") != base.get(p))
+    except Exception:
+        changed = -1
+    if changed > 0:
+        lines.append("zcode-sync: %d arquivo(s) com mudança local ainda não sincronizada (o auto-sync em segundo plano cuida disso)." % changed)
+    if lines and state.get("last_remote_version"):
+        lines.append("zcode-sync: último ponto comum v%s (%s)." % (state["last_remote_version"], state.get("updated", "?")))
+    return lines
+
+
 def last_auto_sync_line(data_dir):
     log = os.path.join(data_dir, "auto-sync.log")
     try:
