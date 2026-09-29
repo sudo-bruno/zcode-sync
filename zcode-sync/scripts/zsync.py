@@ -1291,6 +1291,9 @@ def run_sync(ctx):
 
         if bsha is None:
             # add/add sem ancestral comum (ex.: primeira sync com conteúdo divergente)
+            if p.startswith(SESS_EXPORT_DIR) and _auto_resolve_session(
+                    ctx, p, lentry, rentry, backend, remote, final, converged_base, report):
+                continue
             copy = write_conflict_copy(ctx, p, blob_get(ctx, backend, rsha), rsha, remote, cp)
             new_conflicts[p] = {"kind": "add/add", "theirs_sha": rsha, "copy": copy,
                                 "remote_device": remote.get("device", "?"), "ts": now_stamp()}
@@ -1302,6 +1305,9 @@ def run_sync(ctx):
         base_data = blob_get(ctx, backend, bsha)
         ours_data = ctx.read_local(p)
         theirs_data = blob_get(ctx, backend, rsha)
+        if p.startswith(SESS_EXPORT_DIR) and _auto_resolve_session(
+                ctx, p, lentry, rentry, backend, remote, final, converged_base, report):
+            continue
         merged, had_conflict = merge3_bytes(base_data, ours_data, theirs_data)
         if not had_conflict and merged is not None:
             ctx.write_local(p, merged)
@@ -1345,6 +1351,35 @@ def run_sync(ctx):
 
 def ctx_drop_conflict(pending, path):
     pending.pop(path, None)
+
+
+SESS_EXPORT_DIR = "cli/sessions-export/"
+
+
+def _auto_resolve_session(ctx, p, lentry, rentry, backend, remote, final,
+                          converged_base, report):
+    """Snapshots de sessão têm DONO único (a máquina que criou a sessão — as
+    importadas nunca re-exportam). Conflito entre snapshots = versão mais nova
+    contra mais velha do MESMO dono: dono mantém a sua; importadora aceita a do
+    dono. Retorna True se resolvido automaticamente."""
+    try:
+        imported = _sibling("sessions").is_imported_session(ctx.data_dir, p)
+    except Exception:
+        imported = False
+    if imported:
+        data = blob_get(ctx, backend, rentry["sha256"])
+        ctx.write_local(p, data)
+        final[p] = attr_entry({"sha256": rentry["sha256"], "size": len(data)},
+                              rentry.get("by") or remote.get("device", "?"),
+                              rentry.get("at") or remote.get("updated"))
+        converged_base[p] = rentry["sha256"]
+        report.add("baixado", p, "versão do dono da sessão aplicada (arquivo importado)")
+        return True
+    # somos o dono: nosso export é o snapshot mais recente
+    final[p] = attr_entry(lentry, ctx.device)
+    converged_base[p] = lentry["sha256"]
+    report.add("aviso", p, "versão local mantida (export mais novo da sessão dona)")
+    return True
 
 
 def write_conflict_copy(ctx, p, theirs_data, rsha, remote, existing_cp):

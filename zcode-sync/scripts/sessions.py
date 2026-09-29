@@ -291,6 +291,14 @@ def export_files(out_dir):
                   glob.glob(os.path.join(out_dir, "*.json.gz")))
 
 
+def is_imported_session(data_dir, rel):
+    """True se a sessão deste arquivo de export foi IMPORTADA aqui — o dono
+    dela é outra máquina, então a versão do dono sempre prevalece no sync."""
+    sid = os.path.basename(rel).split(".")[0]
+    st = State(data_dir)
+    return sid in (st.d.get("imported") or {})
+
+
 def session_id_of(path):
     name = os.path.basename(path)
     if name.endswith(".json.gz"):
