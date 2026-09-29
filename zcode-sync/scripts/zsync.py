@@ -31,7 +31,7 @@ import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 
 OAUTH_AUTH = "https://accounts.google.com/o/oauth2/v2/auth"
 OAUTH_TOKEN = "https://oauth2.googleapis.com/token"
@@ -44,8 +44,10 @@ SCOPES = "openid email https://www.googleapis.com/auth/drive.appdata"
 # Whitelist fechada: só isto sincroniza. Nada de cli/config.json, cli/db, v2/credentials.json, workspace/.
 # v2/config.json e v2/provider_config.json NÃO sincronizam (0.6.2): providers são
 # por máquina — sincronizar sobrescreveu a config de uma ponta com a da outra.
+# cli/zsync-projects (0.10.0): acks por máquina do sync de código por bundle git.
 SYNC_ROOTS = ["skills", "agents", "commands", "AGENTS.md", os.path.join("cli", "memories"),
-              os.path.join("cli", "sessions-export"), "zsync-projects.json"]
+              os.path.join("cli", "sessions-export"), "zsync-projects.json",
+              os.path.join("cli", "zsync-projects")]
 SINGLE_FILES = {"AGENTS.md", "zsync-projects.json"}
 # Nunca tocados pelo sync, mesmo se entrarem no manifesto por uma máquina antiga.
 NEVER_SYNC = {"v2/config.json", "v2/provider_config.json"}
@@ -317,6 +319,18 @@ class FileBackend:
         with open(os.path.join(self.root, "objects", sha), "rb") as f:
             return f.read()
 
+    def put_named(self, name, data):
+        p = os.path.join(self.root, name)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        atomic_write(p, data)
+
+    def get_named(self, name):
+        p = os.path.join(self.root, name)
+        if not os.path.exists(p):
+            return None
+        with open(p, "rb") as f:
+            return f.read()
+
     def list_objects(self):
         out = {}
         objdir = os.path.join(self.root, "objects")
@@ -446,6 +460,16 @@ class DriveBackend:
         fid = self._file_id("objects/" + sha)
         if not fid:
             raise SyncError("blob ausente no Drive: %s" % sha)
+        return self._req("GET", DRIVE_API + "/files/%s?alt=media" % fid)
+
+    def put_named(self, name, data):
+        fid = self._file_id(name)
+        self._upload(name, data, "application/octet-stream", file_id=fid)
+
+    def get_named(self, name):
+        fid = self._file_id(name)
+        if not fid:
+            return None
         return self._req("GET", DRIVE_API + "/files/%s?alt=media" % fid)
 
     def _upload(self, name, data, ctype, file_id=None):
@@ -655,6 +679,8 @@ def _prune_candidates(ctx, backend, days):
     for name, created in backend.list_objects().items():
         if name in referenced or created == 0 or created > cutoff:
             continue
+        if name.startswith("bundles/"):
+            continue  # bundles de código (0.10.0): gerenciados pelo fluxo de projetos
         candidates.append(name)
     return sorted(candidates)
 
@@ -1350,10 +1376,12 @@ def cmd_sync(ctx, args_json, args=None):
         except Exception as e:
             pre = ["aviso: export de sessões falhou: %r" % e]
     if args is not None and getattr(args, "pull_projects", False):
+        # 0.10.0: checkpoint + bundle + upload do CÓDIGO antes de subir o manifesto
         try:
-            pre += _sibling("projects").pull(ctx.root)["lines"]
+            backend = get_backend(ctx)
+            pre += _sibling("projects").export_code(ctx.root, ctx.data_dir, backend, ctx.device)["lines"]
         except Exception as e:
-            pre.append("aviso: pull de projetos falhou: %r" % e)
+            pre.append("aviso: export de código (projetos) falhou: %r" % e)
     lock = acquire_lock(ctx.data_dir)
     try:
         last_err = None
@@ -1370,6 +1398,15 @@ def cmd_sync(ctx, args_json, args=None):
                     note = maybe_auto_prune(ctx)
                     if note:
                         lines.append(note)
+                if args is not None and getattr(args, "pull_projects", False):
+                    # 0.10.0: buscar bundles das outras máquinas e git merge do que há de novo
+                    try:
+                        imp = _sibling("projects").import_code(ctx.root, ctx.data_dir,
+                                                               get_backend(ctx), ctx.device)
+                        if imp["lines"]:
+                            lines += [""] + imp["lines"]
+                    except Exception as e:
+                        lines.append("aviso: merge de código (projetos) falhou: %r" % e)
                 return out(args_json, ok=True, lines=lines,
                            events=report.events, pushed=pushed,
                            conflicts=ctx.conflicts())
@@ -1477,11 +1514,8 @@ def cmd_status(ctx, args_json):
     except Exception:
         pass
     try:
-        proj = _sibling("projects").load(ctx.root).get("projects") or []
-        if proj:
-            missing = sum(1 for p in proj if not os.path.isdir(p.get("path") or ""))
-            lines.append("projetos: %d no manifesto, %d ausente(s) aqui%s" % (
-                len(proj), missing, " — /zsync:projects clone" if missing else ""))
+        for pline in _sibling("projects").status(ctx.root, ctx.data_dir)["lines"][-1:]:
+            lines.append("projetos: %s" % pline.strip())
     except Exception:
         pass
     pending = ctx.conflicts()
@@ -1583,13 +1617,14 @@ def cmd_projects(ctx, args_json, args):
     mod = _sibling("projects")
     action = getattr(args, "action", "status")
     if action == "scan":
-        r = mod.scan(ctx.root)
+        r = mod.scan(ctx.root, ctx.data_dir, ctx.device)
     elif action == "clone":
-        r = mod.clone(ctx.root, into=getattr(args, "into", None))
+        r = mod.clone(ctx.root, ctx.data_dir, get_backend(ctx), ctx.device,
+                      into=getattr(args, "into", None))
     elif action == "pull":
-        r = mod.pull(ctx.root)
+        r = mod.import_code(ctx.root, ctx.data_dir, get_backend(ctx), ctx.device)
     else:
-        r = mod.status(ctx.root)
+        r = mod.status(ctx.root, ctx.data_dir)
     return out(args_json, ok=r.get("ok", True), lines=r["lines"],
                **{k: v for k, v in r.items() if k not in ("ok", "lines")})
 
@@ -1614,7 +1649,7 @@ def main(argv):
     sync_p.add_argument("--export-sessions", action="store_true",
                         help="exporta sessões novas/alteradas antes de sincronizar")
     sync_p.add_argument("--pull-projects", action="store_true",
-                        help="git pull --ff-only nos projetos existentes antes de sincronizar")
+                        help="sincroniza o código dos projetos junto (checkpoint + bundle antes; git merge depois)")
     sess_p = sub.add_parser("sessions")
     sess_p.add_argument("action", nargs="?", default="status", choices=["status", "export", "import"])
     sess_p.add_argument("--with-tool", action="store_true",

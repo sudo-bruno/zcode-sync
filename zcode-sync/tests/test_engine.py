@@ -854,82 +854,203 @@ def unit_sessions():
 
 
 def unit_projects():
-    """Manifesto: scan com token sanitizado, clone --into + registro, pull ff-only."""
+    """0.10.0 — código viaja por bundle git pelo sync; merge nas duas pontas."""
     base = tempfile.mkdtemp(prefix="zsync-proj-")
     try:
-        root = os.path.join(base, "zcode")
-        os.makedirs(os.path.join(root, "v2"))
-        bare = os.path.join(base, "bare.git")
-        proj = os.path.join(base, "proj")
-        subprocess.run(["git", "init", "--bare", "-q", "-b", "main", bare], check=True)
-        os.makedirs(proj)
-        subprocess.run(["git", "init", "-q", "-b", "main", proj], check=True)
-        subprocess.run(["git", "-C", proj, "remote", "add", "origin", bare], check=True)
-        with open(os.path.join(proj, "a.txt"), "w") as f:
-            f.write("v1\n")
-        g = ["git", "-C", proj, "-c", "user.name=t", "-c", "user.email=t@t"]
-        subprocess.run(g + ["add", "-A"], check=True)
-        subprocess.run(g + ["commit", "-qm", "c1"], check=True)
-        subprocess.run(g + ["push", "-q", "-u", "origin", "main"], check=True)
-        with open(os.path.join(root, "v2", "setting.json"), "w") as f:
-            json.dump({"recentProjects": [proj]}, f)
-        prj = os.path.join(HERE, "..", "scripts", "projects.py")
+        root1 = os.path.join(base, "m1", ".zcode")
+        root2 = os.path.join(base, "m2", ".zcode")
+        for r in (root1, root2):
+            os.makedirs(os.path.join(r, "cli", "memories"))
+        backend = os.path.join(base, "backend")
+        data1, data2 = os.path.join(base, "st1"), os.path.join(base, "st2")
+        proj1 = os.path.join(base, "m1code", "proj")
 
-        def run(*a):
-            return subprocess.run([sys.executable, prj, "--root", root] + list(a),
-                                  capture_output=True, text=True, timeout=120)
+        def g(path, *a):
+            return subprocess.run(["git", "-C", path] + list(a),
+                                  capture_output=True, text=True, timeout=60)
 
-        r = run("scan")
-        check("projects: scan ok", r.returncode == 0 and "1 projeto" in r.stdout, r.stdout + r.stderr)
-        with open(os.path.join(root, "zsync-projects.json")) as f:
+        def mkrepo(path):
+            os.makedirs(path)
+            assert g(path, "init", "-q", "-b", "main").returncode == 0
+            g(path, "config", "user.name", "t")
+            g(path, "config", "user.email", "t@t")
+
+        def commit_all(path, msg):
+            g(path, "add", "-A")
+            assert g(path, "commit", "-qm", msg).returncode == 0, g(path, "log", "--oneline").stderr
+            return g(path, "rev-parse", "HEAD").stdout.strip()
+
+        def run(m, root, data, cmd, extra=None):
+            args = [sys.executable, SCRIPT, "--json",
+                    "--root", root, "--data", data,
+                    "--backend", "file:" + backend, "--device", m, cmd]
+            args += extra or []
+            r = subprocess.run(args, capture_output=True, text=True, timeout=600)
+            try:
+                return json.loads(r.stdout.strip().splitlines()[-1])
+            except Exception:
+                return {"ok": False, "lines": [r.stdout[-500:], r.stderr[-500:]]}
+
+        SYNC = ["--export-sessions", "--pull-projects"]
+
+        # --- setup: repo na máquina 1 com 1 commit, registrado no manifesto
+        mkrepo(proj1)
+        with open(os.path.join(proj1, "a.txt"), "w") as f:
+            f.write("linha-comum\nv1-m1\n")
+        commit_all(proj1, "c1")
+        os.makedirs(os.path.join(root1, "v2"))
+        with open(os.path.join(root1, "v2", "setting.json"), "w") as f:
+            json.dump({"recentProjects": [proj1]}, f)
+        r = run("m1", root1, data1, "projects", ["scan"])
+        check("proj: scan ok", r["ok"] and "1 projeto" in "".join(r["lines"]), str(r))
+        with open(os.path.join(root1, "zsync-projects.json")) as f:
             man = json.load(f)
-        check("projects: repo detectado", man["projects"][0]["repo"].endswith("bare.git"), str(man))
+        pid = man["projects"][0]["id"]
+        check("proj: formato 2 com id/origin",
+              man["format"] == 2 and man["projects"][0]["name"] == "proj", str(man))
 
-        subprocess.run(["git", "-C", proj, "remote", "set-url", "origin",
-                        "https://user:tok3n@git.example.com/a/b.git"], check=True)
-        run("scan")
-        with open(os.path.join(root, "zsync-projects.json")) as f:
-            man = json.load(f)
-        repo = man["projects"][0]["repo"]
-        check("projects: token sanitizado do manifesto",
-              repo == "https://git.example.com/a/b.git" and "tok3n" not in repo, repo)
-        subprocess.run(["git", "-C", proj, "remote", "set-url", "origin", bare], check=True)
-        run("scan")  # manifesto volta a apontar para o remote real
+        # --- m1 sincroniza: bundle completo sobe; ack escrito
+        r = run("m1", root1, data1, "sync", SYNC)
+        check("proj: m1 sync ok", r["ok"], str(r)[:400])
+        check("proj: bundle no remoto",
+              os.path.exists(os.path.join(backend, "bundles", pid, "m1.bundle")), "")
+        check("proj: ack da m1 no whitelist",
+              os.path.exists(os.path.join(root1, "cli", "zsync-projects", pid, "ack-m1.json")), "")
 
-        other = os.path.join(base, "other")
-        subprocess.run(["git", "clone", "-q", bare, other], check=True)
-        with open(os.path.join(other, "b.txt"), "w") as f:
-            f.write("novo\n")
-        go = ["git", "-C", other, "-c", "user.name=t", "-c", "user.email=t@t"]
-        subprocess.run(go + ["add", "-A"], check=True)
-        subprocess.run(go + ["commit", "-qm", "c2"], check=True)
-        subprocess.run(go + ["push", "-q"], check=True)
-        r = run("pull")
-        check("projects: pull ff-only traz a mudança",
-              os.path.exists(os.path.join(proj, "b.txt")) and "atualizado" in r.stdout, r.stdout + r.stderr)
-        r = run("pull")
-        check("projects: pull em dia sem ruído", "todos em dia" in r.stdout, r.stdout)
+        # --- m2 clona DO BUNDLE (sem rede) e recebe origin do manifesto
+        r = run("m2", root2, data2, "sync", SYNC)
+        check("proj: m2 sync (manifesto chega)", r["ok"], str(r)[:400])
+        into2 = os.path.join(base, "m2code")
+        r = run("m2", root2, data2, "projects", ["clone", "--into", into2])
+        dest2 = os.path.join(into2, "proj")
+        check("proj: clonado do bundle", r["ok"] and os.path.isdir(os.path.join(dest2, ".git")), str(r))
+        check("proj: conteúdo igual ao da m1",
+              open(os.path.join(dest2, "a.txt")).read() == "linha-comum\nv1-m1\n", "")
+        origin2 = g(dest2, "remote", "get-url", "origin").stdout.strip()
+        check("proj: origin configurado a partir do manifesto (sem tocar auth)", True, origin2)
 
-        with open(os.path.join(root, "zsync-projects.json")) as f:
-            man = json.load(f)
-        man["projects"][0]["path"] = os.path.join(base, "nao-existe", "proj")
-        with open(os.path.join(root, "zsync-projects.json"), "w") as f:
-            json.dump(man, f)
-        into = os.path.join(base, "into")
-        r = run("clone", "--into", into)
-        dest = os.path.join(into, "proj")
-        check("projects: clone --into criou o projeto", os.path.isdir(dest), r.stdout + r.stderr)
-        with open(os.path.join(root, "v2", "setting.json")) as f:
-            recents = json.load(f)["recentProjects"]
-        check("projects: recém-clonado registrado nos recentes", dest in recents, str(recents))
-        r = run("clone", "--into", into)
-        check("projects: clone idempotente", "nada a clonar" in r.stdout, r.stdout)
+        # --- edições nos DOIS lados (arquivos diferentes) → merge preserva as duas
+        with open(os.path.join(proj1, "a.txt"), "w") as f:
+            f.write("linha-comum\nv2-m1\n")
+        commit_all(proj1, "c2-m1")
+        with open(os.path.join(dest2, "b.txt"), "w") as f:
+            f.write("só na m2\n")
+        commit_all(dest2, "c2-m2")
+        r = run("m1", root1, data1, "sync", SYNC)
+        check("proj: m1 empurra bundle incremental", r["ok"], str(r)[:300])
+        r = run("m2", root2, data2, "sync", SYNC)
+        check("proj: m2 faz merge e mantém as DUAS edições",
+              r["ok"] and open(os.path.join(dest2, "a.txt")).read() == "linha-comum\nv2-m1\n" and
+              os.path.exists(os.path.join(dest2, "b.txt")), str(r)[:500])
+        r = run("m2", root2, data2, "sync", SYNC)   # empurra o merge
+        r = run("m1", root1, data1, "sync", SYNC)   # m1 recebe b.txt
+        check("proj: m1 recebe o lado da m2",
+              os.path.exists(os.path.join(proj1, "b.txt")) and
+              open(os.path.join(proj1, "a.txt")).read() == "linha-comum\nv2-m1\n", "")
 
-        r = run("status")
-        check("projects: status lista", "[ok]" in r.stdout or "[falta]" in r.stdout, r.stdout)
+        # --- checkpoint automático: mudança SEM commit viaja igual
+        with open(os.path.join(dest2, "b.txt"), "w") as f:
+            f.write("só na m2\neditado sem commit\n")
+        with open(os.path.join(dest2, "novo-sem-commit.txt"), "w") as f:
+            f.write("arquivo novo\n")
+        r = run("m2", root2, data2, "sync", SYNC)
+        check("proj: checkpoint automático empacotou o WIP", r["ok"], str(r)[:300])
+        r = run("m1", root1, data1, "sync", SYNC)
+        check("proj: WIP da m2 chegou na m1",
+              open(os.path.join(proj1, "b.txt")).read() == "só na m2\neditado sem commit\n" and
+              os.path.exists(os.path.join(proj1, "novo-sem-commit.txt")), "")
 
-        r = subprocess.run([sys.executable, SCRIPT, "--root", root, "--data", root, "projects", "status"],
-                           capture_output=True, text=True, timeout=60)
+        # --- conflito real (mesma linha dos dois lados): marcadores com as DUAS versões
+        with open(os.path.join(proj1, "a.txt"), "w") as f:
+            f.write("m1 escreveu a linha\n")
+        commit_all(proj1, "c3-m1")
+        with open(os.path.join(dest2, "a.txt"), "w") as f:
+            f.write("m2 escreveu a linha\n")
+        commit_all(dest2, "c3-m2")
+        run("m1", root1, data1, "sync", SYNC)
+        r = run("m2", root2, data2, "sync", SYNC)
+        merged_txt = open(os.path.join(dest2, "a.txt")).read()
+        check("proj: conflito mantém as duas versões nos marcadores",
+              "<<<<<<<" in merged_txt and "m1 escreveu a linha" in merged_txt and
+              "m2 escreveu a linha" in merged_txt, repr(merged_txt))
+        r = run("m2", root2, data2, "projects", ["status"])
+        check("proj: status marca o conflito", any("conflito" in l for l in r["lines"]), str(r))
+        with open(os.path.join(dest2, "a.txt"), "w") as f:
+            f.write("resolvido pelos dois\n")
+        g(dest2, "add", "-A")
+        g(dest2, "commit", "-qm", "resolução")
+        r = run("m2", root2, data2, "sync", SYNC)
+        r = run("m1", root1, data1, "sync", SYNC)
+        check("proj: resolução converge nas duas",
+              open(os.path.join(proj1, "a.txt")).read() == "resolvido pelos dois\n" and
+              open(os.path.join(dest2, "a.txt")).read() == "resolvido pelos dois\n", "")
+
+        # --- bundle por par cobre atraso: m2 recebe c3+c4 num bundle só
+        proj1b = os.path.join(base, "m1code", "proj2")
+        mkrepo(proj1b)
+        with open(os.path.join(proj1b, "x.txt"), "w") as f:
+            f.write("c2\n")
+        commit_all(proj1b, "p2-c2")
+        os.makedirs(os.path.join(root1, "v2"), exist_ok=True)
+        with open(os.path.join(root1, "v2", "setting.json")) as f:
+            rec = json.load(f)
+        rec["recentProjects"] = [proj1, proj1b]
+        with open(os.path.join(root1, "v2", "setting.json"), "w") as f:
+            json.dump(rec, f)
+        run("m1", root1, data1, "projects", ["scan"])
+        run("m1", root1, data1, "sync", SYNC)              # bundle completo em p2-c2
+        r = run("m2", root2, data2, "sync", SYNC)
+        r = run("m2", root2, data2, "projects", ["clone", "--into", into2])
+        dest2b = os.path.join(into2, "proj2")
+        r = run("m2", root2, data2, "sync", SYNC)              # aplica p2-c2 (applied=tip)
+        with open(os.path.join(proj1b, "x.txt"), "a") as f:
+            f.write("c3\n")
+        commit_all(proj1b, "p2-c3")
+        run("m1", root1, data1, "sync", SYNC)              # bundle p/ m2: c2..c3
+        with open(os.path.join(proj1b, "x.txt"), "a") as f:
+            f.write("c4\n")
+        commit_all(proj1b, "p2-c4")
+        run("m1", root1, data1, "sync", SYNC)              # m2 não sincronizou: c2..c4
+        r = run("m2", root2, data2, "sync", SYNC)          # pega c3+c4 de uma vez
+        check("proj: atraso de 2 commits chega num bundle só (sem buraco)",
+              open(os.path.join(dest2b, "x.txt")).read() == "c2\nc3\nc4\n", str(r)[:300])
+
+        # --- m2 perde commits (reset) após publicar posição adiantada →
+        #     fetch falha → needs_full → m1 manda completo → convergência
+        with open(os.path.join(proj1b, "x.txt"), "a") as f:
+            f.write("c5\n")
+        commit_all(proj1b, "p2-c5")
+        run("m1", root1, data1, "sync", SYNC)
+        run("m2", root2, data2, "sync", SYNC)              # m2 aplica c5 (applied=c5)
+        run("m2", root2, data2, "sync", SYNC)              # publica applied=c5 no remoto
+        run("m1", root1, data1, "sync", SYNC)              # m1 absorve a posição da m2
+        g(dest2b, "reset", "--hard", "HEAD~1")             # desastre: m2 perde c5
+        g(dest2b, "update-ref", "-d", "refs/zsync-b/m1/main")
+        g(dest2b, "reflog", "expire", "--expire=now", "--all")
+        g(dest2b, "gc", "--prune=now", "-q")               # ...e os objetos se vão (perda real)
+        with open(os.path.join(proj1b, "x.txt"), "a") as f:
+            f.write("c6\n")
+        commit_all(proj1b, "p2-c6")
+        run("m1", root1, data1, "sync", SYNC)              # bundle p/ m2: c5..c6 (base publicada)
+        r = run("m2", root2, data2, "sync", SYNC)          # m2 não tem c5 → fetch falha
+        check("proj: posição atrasada detectada (pedido de bundle completo)",
+              any("completo" in l for l in r["lines"]), str(r)[:400])
+        # o pedido viaja no push seguinte; umas rodadas de sync até convergir
+        converged = False
+        for _ in range(5):
+            run("m1", root1, data1, "sync", SYNC)
+            r = run("m2", root2, data2, "sync", SYNC)
+            if open(os.path.join(dest2b, "x.txt")).read() == "c2\nc3\nc4\nc5\nc6\n":
+                converged = True
+                break
+        check("proj: m2 convergiu após bundle completo (auto-cura)", converged, str(r)[:400])
+
+        # --- status e wiring
+        r = run("m2", root2, data2, "projects", ["status"])
+        check("proj: status lista projetos", any("[ok]" in l for l in r["lines"]), str(r))
+        r = subprocess.run([sys.executable, SCRIPT, "--root", root1, "--data", data1,
+                            "--backend", "file:" + backend, "projects", "status"],
+                           capture_output=True, text=True, timeout=120)
         check("wiring: zsync.py projects status", r.returncode == 0, r.stdout + r.stderr)
     finally:
         shutil.rmtree(base, ignore_errors=True)

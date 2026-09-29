@@ -99,14 +99,19 @@ O banco de sessões (sqlite) não viaja — não existe formato de merge para el
 - Re-exportar sem mudanças gera **bytes idênticos** (gzip com timestamp fixo): nada trafega de novo.
 - O export roda sozinho antes de cada sync (manual e automático) e é incremental: só sessões novas/alteradas.
 
-## Projetos (código via git)
+## Projetos — o código sincroniza pelo plugin (0.10.0)
 
-O manifesto `~/.zcode/zsync-projects.json` lista os projetos com o remote git de cada um e viaja no sync. O código em si **não passa pelo Drive** — binários grandes ficam no git, e o que trafega são os diffs do próprio git:
+O **código dos projetos viaja pelo mesmo sync** (Drive), empacotado pelo próprio git — não é preciso ter o remote acessível nem clonar da rede:
 
-1. `/zsync:projects scan` — na máquina principal, monta o manifesto (projetos recentes do ZCode + `git remote get-url origin`). URLs com token embutido são **sanitizadas** antes de entrar no manifesto (ele vai para o Drive).
-2. `/zsync:projects` — mostra o que existe e o que falta nesta máquina.
-3. `/zsync:projects clone [--into <dir>]` — clona o que falta (o `--into` remapeia o destino quando os caminhos diferem entre máquinas; os clonados entram sozinhos nos projetos recentes do ZCode).
-4. `/zsync:projects pull` — `git pull --ff-only` nos projetos existentes (traz o que você subiu nas outras máquinas). O sync automático também roda isso antes de subir.
+1. `/zsync:projects scan` — na máquina principal, monta a lista compartilhada (`zsync-projects.json`: nome + remote origin sanitizado). Caminhos são locais de cada máquina.
+2. A cada sync, cada máquina com o projeto: **checkpoint automático** do working tree (`git add -A` + commit próprio, respeitando `.gitignore`) e upload de um **bundle por par de máquinas** (`bundles/<projeto>/<de>__<para>.bundle`), cortado exatamente na posição que o par publicou já ter aplicado — nunca há "buraco".
+3. A outra máquina **busca o bundle e faz `git merge` de verdade**: edição aqui + edição lá em regiões distintas = **as duas se mantêm** (é git); mesma linha alterada dos dois lados = marcadores `<<<<<<<` nos arquivos com as duas versões dentro — você resolve no git e commita; **nada se perde**. Conflito de merge aparece no `/zsync:status`.
+4. `/zsync:projects clone [--into <dir>]` — materializa um projeto que falta **clonando do bundle** (sem rede), já com o remote origin configurado a partir do manifesto. A autenticação git (Forgejo/GitHub) é config de cada máquina — o plugin nunca toca nisso.
+5. `/zsync:projects pull` — força agora o fetch+merge dos bundles das outras máquinas (o sync automático já faz).
+
+**Auto-cura:** se a posição publicada de um par estiver atrasada em relação à realidade (ex.: commits perdidos, repo refeito), o fetch do bundle falha e a máquina pede um **bundle completo** — chega sozinho nos syncs seguintes e a convergência acontece sem intervenção.
+
+Notas: o checkpoint automático só inclui o que o git rastrearia (`.gitignore` manda — mantenha `node_modules/` etc. ignorados); projetos precisam ser repositós git; o merge usa o branch atual de cada máquina.
 
 ## Configuração única: Google Cloud (~10 minutos, uma vez)
 

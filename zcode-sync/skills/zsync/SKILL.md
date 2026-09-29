@@ -11,14 +11,16 @@ Sempre execute a ação através do script do plugin, nunca editando arquivos de
 python3 "<base da skill>/../scripts/zsync.py" --json <comando>
 ```
 
-Comandos: `login`, `logout`, `status`, `sync`, `sessions [status|export|import]`, `projects [status|scan|clone]`, `conflicts`, `resolve --path <p> --choice keep-ours|take-theirs|delete`.
+Comandos: `login`, `logout`, `status`, `sync`, `sessions [status|export|import]`, `projects [status|scan|clone|pull]`, `prune`, `conflicts`, `resolve --path <p> --choice keep-ours|take-theirs|delete`.
 
 ## Como o sync funciona (para explicar ao usuário)
 
 - O remoto é uma pasta oculta e isolada do Google Drive (appDataFolder) — invisível na interface do Drive, só este plugin acessa.
 - Lógica estilo git: manifesto versionado + blobs por conteúdo. Se outra máquina subiu mudanças, o sync faz "rebase" primeiro (merge de texto em 3 vias por arquivo) e só depois empurra o que esta máquina tem.
-- Nunca sobrescreve silenciosamente: conflito real mantém o lado local no arquivo original e salva o lado remoto em `*.sync-conflict-<máquina>-<data>`. O push fica bloqueado até resolver com `resolve`.
-- Só sincroniza o whitelist: `skills/`, `agents/`, `commands/`, `AGENTS.md`, `cli/memories/`. Configurações, sessões e credenciais nunca saem da máquina.
+- Nunca sobrescreve silenciosamente: conflito real mantém o lado local no arquivo original e salva o lado remoto em `*.sync-conflict-<máquina>-<data>`. O push fica bloqueado até resolver com `resolve`. Remoto JSON "muito mais pobre" que o local (padrão de instalação nova) vai para quarentena em vez de aplicar.
+- Só sincroniza o whitelist: `skills/`, `agents/`, `commands/`, `AGENTS.md`, `cli/memories/`, `cli/sessions-export/`, `zsync-projects.json`, `cli/zsync-projects/`. Configurações de provider e credenciais nunca saem da máquina.
+- **Código dos projetos viaja como bundles do git pelo mesmo canal**: cada máquina faz checkpoint automático do working tree, empacota (`git bundle`) e a outra faz `git merge` de verdade — edições nos dois lados se preservam; mesma linha alterada = marcadores de conflito do git para resolver no repo. Autenticação git (Forgejo/GitHub) é de cada máquina; o plugin só configura o remote origin.
+- Sessões viajam como `.json.gz` por sessão; importar com `/zsync:sessions import` (melhor com o app fechado).
 
 ## Regras de operação
 
