@@ -21,6 +21,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -29,6 +30,12 @@ import time
 
 DB_REL = os.path.join("cli", "db", "db.sqlite")
 DB_OBJ_DIR = "db"
+# 0.14.0 — o ÍNDICE DE TAREFAS (v2/tasks-index.sqlite) também viaja: é a tabela
+# que faz os PROJETOS aparecerem na barra lateral do ZCode (leitura por
+# workspace_key = caminho local). Mesmo fluxo do banco: snapshot consistentes
+# por máquina + diff por linha, com os caminhos TRADUZIDOS (mirror.py).
+TASKS_REL = os.path.join("v2", "tasks-index.sqlite")
+TASKS_OBJ_DIR = "tasks"
 MAX_SNAPSHOTS = 2          # snapshots retidos por máquina no Drive
 MAX_LOCAL_BACKUPS = 2      # backups do banco local antes de cada merge
 BUSY_TIMEOUT_MS = 30000
@@ -37,6 +44,20 @@ AUTO_INTERVAL = 6 * 3600   # no auto-sync, snapshot no máximo 1×/6h
 
 def db_path(root):
     return os.path.join(root, DB_REL)
+
+
+def tasks_path(root):
+    return os.path.join(root, TASKS_REL)
+
+
+def _load_mirror():
+    """Módulo vizinho mirror.py (tradução de caminhos entre máquinas)."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mirror.py")
+    spec = importlib.util.spec_from_file_location("zsync_mirror", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _state_path(state_dir):
@@ -63,9 +84,8 @@ def _save_state(state_dir, st):
     os.replace(tmp, _state_path(state_dir))
 
 
-def _make_snapshot(root, tmp_out):
-    """Backup API: snapshot consistente do banco (com WAL) em tmp_out."""
-    src = db_path(root)
+def _snapshot_path(src, tmp_out):
+    """Backup API: snapshot consistente de um sqlite (com WAL) em tmp_out."""
     if not os.path.exists(src):
         return False
     s = sqlite3.connect("file:%s?mode=ro" % src, uri=True)
@@ -75,6 +95,10 @@ def _make_snapshot(root, tmp_out):
     s.close()
     d.close()
     return True
+
+
+def _make_snapshot(root, tmp_out):
+    return _snapshot_path(db_path(root), tmp_out)
 
 
 def _gzip_file(path):
@@ -89,31 +113,68 @@ def _gzip_file(path):
     return data
 
 
-def _backup_local_db(root, state_dir):
-    """Cópia de segurança do banco local antes do merge (mantém 2)."""
-    src = db_path(root)
+def _prune_backup_dir(bdir):
+    """Retenção dos backups: 2 cópias do BANCO (o arquivo caro) e a última do
+    índice; limpa restos de backups interrompidos (-journal de transação)."""
+    try:
+        names = os.listdir(bdir)
+    except OSError:
+        return
+    for n in names:
+        if n.endswith("-journal"):
+            try:
+                os.remove(os.path.join(bdir, n))
+            except OSError:
+                pass
+    sqls = [os.path.join(bdir, n) for n in names if n.endswith(".sqlite")]
+    dbs = [p for p in sqls if os.path.basename(p).startswith("db-")
+           or re.match(r"^\d{8}-\d{6}\.sqlite$", os.path.basename(p))]
+    others = [p for p in sqls if p not in dbs]
+    for extra in sorted(dbs, key=os.path.getmtime)[:-MAX_LOCAL_BACKUPS]:
+        try:
+            os.remove(extra)
+        except OSError:
+            pass
+    for extra in sorted(others, key=os.path.getmtime)[:-1]:
+        try:
+            os.remove(extra)
+        except OSError:
+            pass
+
+
+def _backup_db_file(src, state_dir, tag):
+    """Cópia de segurança (backup API) de um sqlite antes do merge; a retenção é
+    de 2 arquivos no diretório inteiro. Sem espaço para a cópia, NÃO cria um
+    arquivo parcial: desiste e devolve None (o chamador decide)."""
     if not os.path.exists(src):
         return None
     bdir = os.path.join(state_dir, "db-backup")
     os.makedirs(bdir, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    dst = os.path.join(bdir, "%s.sqlite" % stamp)
+    dst = os.path.join(bdir, "%s-%s.sqlite" % (tag, stamp))
     try:
+        if shutil.disk_usage(bdir).free < os.path.getsize(src) * 11 // 10:
+            return None
         s = sqlite3.connect("file:%s?mode=ro" % src, uri=True)
         d = sqlite3.connect(dst)
         with d:
             s.backup(d)
         s.close()
         d.close()
-    except sqlite3.Error:
+    except (sqlite3.Error, OSError):
+        for leftover in (dst, dst + "-journal"):
+            try:
+                os.remove(leftover)
+            except OSError:
+                pass
         return None
-    olds = sorted(glob.glob(os.path.join(bdir, "*.sqlite")))
-    for extra in olds[:-MAX_LOCAL_BACKUPS]:
-        try:
-            os.remove(extra)
-        except OSError:
-            pass
+    _prune_backup_dir(bdir)
     return dst
+
+
+def _backup_local_db(root, state_dir):
+    """Cópia de segurança do banco local antes do merge (mantém 2)."""
+    return _backup_db_file(db_path(root), state_dir, "db")
 
 
 def snapshot_upload(root, state_dir, backend, device, force=False, auto=False):
@@ -159,6 +220,111 @@ def snapshot_upload(root, state_dir, backend, device, force=False, auto=False):
     return {"ok": True, "lines": lines}
 
 
+def tasks_snapshot_upload(root, state_dir, backend, device, force=False, auto=False):
+    """Sobe o índice de tarefas comprimido (tasks/<device>/<sha12>.sqlite.gz).
+    É ele que carrega os PROJETOS e a organização da barra lateral do ZCode."""
+    st = _load_state(state_dir)
+    if auto and not force and time.time() - st.get("tasks_last_upload_ts", 0) < AUTO_INTERVAL:
+        return {"ok": True, "lines": []}
+    src = tasks_path(root)
+    if not os.path.exists(src):
+        return {"ok": True, "lines": []}
+    fd, tmp = tempfile.mkstemp(prefix="zsync-taskssnap-")
+    os.close(fd)
+    os.remove(tmp)
+    try:
+        if not _snapshot_path(src, tmp):
+            return {"ok": True, "lines": []}
+        data = _gzip_file(tmp)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    sha = hashlib.sha256(data).hexdigest()
+    if not force and st.get("tasks_last_sha") == sha:
+        return {"ok": True, "lines": []}
+    name = "%s/%s/%s.sqlite.gz" % (TASKS_OBJ_DIR, device, sha[:12])
+    try:
+        backend.put_named(name, data)
+    except Exception as e:
+        return {"ok": False, "lines": ["tarefas: upload do índice falhou (%s)" % e]}
+    st["tasks_last_sha"] = sha
+    st["tasks_last_upload_ts"] = time.time()
+    _save_state(state_dir, st)
+    try:
+        mine = sorted(((n, t) for n, t in backend.list_objects().items()
+                       if n.startswith("%s/%s/" % (TASKS_OBJ_DIR, device))),
+                      key=lambda x: -x[1])
+        for extra, _t in mine[MAX_SNAPSHOTS:]:
+            backend.delete_object(extra)
+    except Exception:
+        pass
+    return {"ok": True, "lines": [
+        "tarefas: índice comprimido enviado (%.0f KB) — %s" % (len(data) / 1024.0, name)]}
+
+
+def tasks_merge_peers(root, state_dir, backend, device):
+    """Busca o índice de tarefas das outras máquinas e aplica o diff por linha
+    com os caminhos TRADUZIDOS para esta máquina (mirror.py) — é isso que faz o
+    projeto clonado aparecer no ZCode com as sessões dele."""
+    st = _load_state(state_dir)
+    src = tasks_path(root)
+    if not os.path.exists(src):
+        return {"ok": True, "lines": []}
+    try:
+        objs = backend.list_objects()
+    except Exception:
+        return {"ok": True, "lines": []}
+    prefix = "%s/%s/" % (TASKS_OBJ_DIR, device)
+    applied = st.setdefault("tasks_applied", {})
+    pending = sorted(n for n in objs if n.startswith(TASKS_OBJ_DIR + "/")
+                     and not n.startswith(prefix) and n.endswith(".sqlite.gz")
+                     and applied.get(n) != _sha12_of_name(n))
+    if not pending:
+        return {"ok": True, "lines": []}
+    mirror = _load_mirror()
+    mappings = mirror.build_mappings(root, state_dir, device)
+    lines = []
+    for name in pending:
+        peer = name.split("/")[1]
+        data = backend.get_named(name)
+        if data is None:
+            continue
+        fd, tmp = tempfile.mkstemp(prefix="zsync-tasksmerge-")
+        os.close(fd)
+        try:
+            with open(tmp, "wb") as f:
+                f.write(gzip.decompress(data))
+            _backup_db_file(src, state_dir, "tasks")
+            local = sqlite3.connect(src, timeout=BUSY_TIMEOUT_MS / 1000.0)
+            local.execute("pragma busy_timeout=%d" % BUSY_TIMEOUT_MS)
+            try:
+                local.execute("attach database ? as pdb", (tmp,))
+                counts = mirror.merge_peer_tasks(local, "pdb", mappings, root)
+                local.commit()
+            except sqlite3.OperationalError as e:
+                lines.append("tarefas: merge de %s falhou (%s) — feche o ZCode e rode /zsync:db" % (peer, e))
+                continue
+            finally:
+                try:
+                    local.execute("detach database pdb")
+                except sqlite3.Error:
+                    pass
+                local.close()
+            applied[name] = _sha12_of_name(name)
+            _save_state(state_dir, st)
+            total = sum(counts.values())
+            if total:
+                top = ", ".join("%s: %d" % kv for kv in sorted(counts.items(), key=lambda x: -x[1])[:4])
+                lines.append("tarefas: índice de %s aplicado — %d linha(s) (%s) — projetos do ZCode atualizados"
+                             % (peer, total, top))
+            else:
+                lines.append("tarefas: índice de %s aplicado — nada novo para esta máquina" % peer)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+    return {"ok": True, "lines": lines}
+
+
 def _table_has_unique_key(conn, schema, table):
     """True se a tabela tem PK ou índice único — sem isso o OR IGNORE não
     deduplica e reaplicar snapshots duplicaria linhas."""
@@ -186,8 +352,6 @@ def merge_peers(root, state_dir, backend, device):
     pending = sorted(n for n in objs if n.startswith(DB_OBJ_DIR + "/")
                      and not n.startswith(prefix) and n.endswith(".sqlite.gz")
                      and st["applied"].get(n) != _sha12_of_name(n))
-    if not pending:
-        return {"ok": True, "lines": []}
     lines = []
     for name in pending:
         peer = name.split("/")[1]
@@ -251,6 +415,14 @@ def merge_peers(root, state_dir, backend, device):
         finally:
             if os.path.exists(tmp):
                 os.remove(tmp)
+    # 0.14.0 — depois de aplicar os snapshots, TRADUZ o que veio da outra
+    # máquina para os caminhos locais (projetos espelhados: as sessões passam a
+    # pertencer ao clone local e aparecem no ZCode) e registra os projetos.
+    try:
+        mr = _load_mirror().apply(root, state_dir, device)
+        lines += mr["lines"]
+    except Exception:
+        pass
     return {"ok": True, "lines": lines}
 
 
@@ -282,6 +454,16 @@ def status(root, state_dir, backend, device):
     pend = [n for n in peers if st["applied"].get(n) != _sha12_of_name(n)]
     if pend:
         lines.append("pendentes de aplicar aqui: %d — rode /zsync:db (app fechado é mais seguro)" % len(pend))
+    ts = tasks_path(root)
+    if os.path.exists(ts):
+        lines.append("índice de tarefas local: %.0f KB (%s)" % (os.path.getsize(ts) / 1024.0, TASKS_REL))
+    tprefix = "%s/%s/" % (TASKS_OBJ_DIR, device)
+    tpeers = sorted(n for n in objs if n.startswith(TASKS_OBJ_DIR + "/") and not n.startswith(tprefix))
+    tmine = sorted(n for n in objs if n.startswith(tprefix))
+    lines.append("índices de tarefas no Drive: %d desta máquina, %d de outras" % (len(tmine), len(tpeers)))
+    tpend = [n for n in tpeers if (st.get("tasks_applied") or {}).get(n) != _sha12_of_name(n)]
+    if tpend:
+        lines.append("índices de tarefas pendentes aqui: %d — rode /zsync:db" % len(tpend))
     return {"ok": True, "lines": lines}
 
 
@@ -326,8 +508,10 @@ def main(argv):
         backend = mod.DriveBackend(mod.Auth(state_dir))
     if args.action == "upload":
         r = snapshot_upload(root, state_dir, backend, device, force=True)
+        r["lines"] += tasks_snapshot_upload(root, state_dir, backend, device, force=True)["lines"]
     elif args.action == "merge":
         r = merge_peers(root, state_dir, backend, device)
+        r["lines"] += tasks_merge_peers(root, state_dir, backend, device)["lines"]
     else:
         r = status(root, state_dir, backend, device)
     for line in r["lines"]:

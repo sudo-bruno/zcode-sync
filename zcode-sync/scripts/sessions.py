@@ -41,6 +41,16 @@ DATA_TABLES = ["session", "message", "part", "session_entry", "todo"]
 USAGE_TABLES = ["model_usage", "tool_usage"]
 
 
+def _load_mirror():
+    """Módulo vizinho mirror.py (tradução de caminhos entre máquinas)."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mirror.py")
+    spec = importlib.util.spec_from_file_location("zsync_mirror", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def now_stamp():
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -360,6 +370,14 @@ def import_sessions(root, data_dir, backup=True):
     state.save()
     if bkp:
         lines.append("backup do banco: %s" % bkp)
+    # 0.14.0 — as sessões importadas chegam com o caminho da OUTRA máquina;
+    # mirror.apply religa ao clone local (é o que faz o projeto aparecer no
+    # ZCode com as sessões dele, em vez de uma pasta órfã).
+    try:
+        mr = _load_mirror().apply(root, data_dir)
+        lines += mr["lines"]
+    except Exception:
+        pass
     lines.append("sessões: %d novas, %d já existiam%s" %
                  (new, existing, (" (%d linhas adicionadas)" % enriched) if enriched else ""))
     if tasks_in:

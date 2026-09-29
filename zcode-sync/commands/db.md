@@ -1,5 +1,5 @@
 ---
-description: Banco de sessões inteiro, comprimido, no Drive — snapshot desta máquina e diff por linha do que as outras máquinas subiram.
+description: Banco de sessões e índice de tarefas (barra lateral) inteiros, comprimidos, no Drive — snapshot desta máquina e diff por linha do que as outras máquinas subiram, com os caminhos traduzidos para os desta.
 ---
 
 zsync-cmd:db $ARGUMENTS

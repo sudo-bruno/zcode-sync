@@ -27,7 +27,7 @@ O zsync tem **motor de merge próprio, estrutural, para JSON** — não usa git 
 - **Empate real** (mesmo campo mudado diferente nas duas): o valor **local** fica na máquina e o remoto vai para a cópia `.sync-conflict-` — nada silencioso, nada perdido, push não trava.
 - Arquivo "de instalação nova" (pobre) encontrando config rica → **o rico fica intacto** (o incidente do 0.6 vira não-evento; e a quarentena de rebaixamento segue como segunda barreira).
 
-Com isso, as configs voltam a sincronizar: `v2/setting.json` (projetos recentes das duas máquinas na sidebar), `cli/config.json` (hooks e MCP das duas pontas se unem, dedup por conteúdo), `v2/agents-state.json` e os **configs de provider** (`v2/config.json` + `v2/provider_config.json` — providers/regras das duas máquinas se unem; a seleção default de cada máquina só é trocada se a outra foi a única a mudá-la). Prefere configs por máquina? **Settings → plugin → Configurar → desligar "Sincronizar configurações"**.
+Com isso, as configs voltam a sincronizar: `v2/setting.json`, `cli/config.json` (hooks e MCP das duas pontas se unem, dedup por conteúdo), `v2/agents-state.json` e os **configs de provider** (`v2/config.json` + `v2/provider_config.json` — providers/regras das duas máquinas se unem; a seleção default de cada máquina só é trocada se a outra foi a única a mudá-la). As **listas de workspace do `setting.json`** (abas abertas e projetos recentes) são **por máquina**: apontam para caminhos locais, então não viajam — cada ponta mantém as suas, e os projetos compartilhados entram sozinhos (ver "Projetos espelhados" abaixo). Prefere configs por máquina? **Settings → plugin → Configurar → desligar "Sincronizar configurações"**.
 
 **Estado do plugin:** vive em `~/.zcode/cli/zsync/` (fora do diretório de dados do plugin, que o app apaga no uninstall). Na primeira execução após atualizar, o estado antigo é migrado sozinho; o login não é perdido.
 
@@ -107,7 +107,7 @@ Preferencial: **Settings → Plugin Management → zcode-sync → Configurar →
 
 ## Sessões e o banco de dados inteiro
 
-**O banco (`db.sqlite`) viaja INTEIRO, comprimido (0.12.0):** cada máquina sobe um snapshot próprio para o Drive (`db/<máquina>/<hash>.sqlite.gz` — guarda os 2 últimos; o seu banco de 1,4 GB fica ~355 MB comprimido). A outra máquina, no sync, **busca o snapshot e aplica o DIFF por linha** (`INSERT OR IGNORE`): só adiciona o que falta — nunca altera nem apaga o que já existe, é idempotente e inclui TUDO (outputs de ferramenta, estatísticas, checkpoints, arquivadas). Antes de aplicar, o banco local é copiado para `~/.zcode/cli/zsync/db-backup/` (2 últimos). O snapshot sobe a cada `/zsync:sync` manual (se o banco mudou) e no máximo 1×/6h no auto-sync. O merge escreve no banco: **mais seguro com o ZCode fechado** — `/zsync:db` (status/upload/merge).
+**O banco (`db.sqlite`) viaja INTEIRO, comprimido (0.12.0):** cada máquina sobe um snapshot próprio para o Drive (`db/<máquina>/<hash>.sqlite.gz` — guarda os 2 últimos; o seu banco de 1,4 GB fica ~355 MB comprimido). A outra máquina, no sync, **busca o snapshot e aplica o DIFF por linha** (`INSERT OR IGNORE`): só adiciona o que falta — nunca altera nem apaga o que já existe, é idempotente e inclui TUDO (outputs de ferramenta, estatísticas, checkpoints, arquivadas). Antes de aplicar, o banco local é copiado para `~/.zcode/cli/zsync/db-backup/` (2 últimas cópias; sem espaço para a cópia, o backup é pulado em vez de virar arquivo parcial). O snapshot sobe a cada `/zsync:sync` manual (se o banco mudou) e no máximo 1×/6h no auto-sync. O merge escreve no banco: **mais seguro com o ZCode fechado** — `/zsync:db` (status/upload/merge). O **índice de tarefas** (`v2/tasks-index.sqlite`) viaja pelo mesmo fluxo, com os caminhos traduzidos na chegada — é o que faz o projeto aparecer na barra lateral (ver "Projetos espelhados").
 
 Além do banco inteiro, o plugin **exporta cada sessão para um arquivo comprimido** (`.json.gz`, gzip determinístico) em `~/.zcode/cli/sessions-export/` (id UUID = nunca colide entre máquinas) e o sync leva esses arquivos como qualquer outro. Na outra máquina, `/zsync:sessions import` aplica o que falta por `INSERT OR IGNORE`: só adiciona, nunca altera nem apaga nada existente; faz backup do banco antes (mantém os 2 últimos) e funciona melhor com o ZCode fechado — as sessões aparecem após reiniciar o app.
 
@@ -130,6 +130,19 @@ O **código dos projetos viaja pelo mesmo sync** (Drive), empacotado pelo própr
 **Auto-cura:** se a posição publicada de um par estiver atrasada em relação à realidade (ex.: commits perdidos, repo refeito), o fetch do bundle falha e a máquina pede um **bundle completo** — chega sozinho nos syncs seguintes e a convergência acontece sem intervenção.
 
 Notas: o checkpoint automático só inclui o que o git rastrearia (`.gitignore` manda — mantenha `node_modules/` etc. ignorados); projetos precisam ser repositós git; o merge usa o branch atual de cada máquina.
+
+## Projetos espelhados — o que faz o projeto APARECER no ZCode (0.14.0)
+
+Código clonado não basta: o ZCode guarda tudo **por caminho absoluto**. O mesmo projeto vive em `/Volumes/WS/Works/SunshineRec` (Mac) e `/home/bruno/Projetos/SunshineRec` (Linux) — as sessões e a lista de tarefas posicionam-se pelo caminho de quem criou, então o que chegava da outra máquina não aparecia na interface. A 0.14.0 resolve isso com um **espelho de projetos**:
+
+1. **O índice de tarefas viaja** (`v2/tasks-index.sqlite`, comprimido: `tasks/<máquina>/<hash>.sqlite.gz`, 2 por máquina) — é a tabela que a barra lateral do ZCode lê (workspace + tarefas + organização). Mesmo fluxo do banco: snapshot consistente + diff por linha, idempotente.
+2. **Os caminhos são TRADUZIDOS na chegada** (módulo `mirror.py`): `/home/bruno/Projetos/SunshineRec/...` → `/Volumes/WS/Works/SunshineRec/...` (e vice-versa), usando o mapa que o sync de código já publica nos acks (`ack-<máquina>.json` → caminho de cada ponta). São rebindadas as linhas de: `session` (`project_id`, `directory`, `path`, `revert` — inclusive subdiretórios do projeto), `input_history`, `permissões por projeto` (`local_setting`/`permission`) e `tasks`/`automations`/ordenação/grupos (com o id de grupo de workspace recomputado). O `project_id` é recalculado com a função exata do ZCode (validada contra o banco real).
+3. **O workspace de conversa** (`~/.zcode/workspace/default`) tem regra universal: conversas criadas na outra máquina aparecem na sua lista de conversas, apontando para o seu caminho.
+4. **O projeto entra nos "recentes"** do ZCode local (a lista que o app mostra para escolher workspace), então ele aparece para abrir com as sessões dele.
+
+Regras de segurança: só traduz projeto **conhecido** (manifesto + ack da outra máquina) e cujo **caminho local existe** (o clone já foi feito); workspace que não existe aqui é ignorado (não polui a lista); linhas já no caminho local nunca são tocadas (idempotente); os valores anteriores das linhas alteradas ficam salvos em `~/.zcode/cli/zsync/db-backup/mirror-*.json` (restaurável à mão) e o índice de tarefas é copiado antes. Desligar tudo: **Settings → plugin → Configurar → "Espelhar projetos"**.
+
+Os **artefatos pesados de sessão** (`cli/agents/<id>`, `cli/exec/<id>` — saídas de subagentes, até 80 MB por sessão) **não viajam** por enquanto: são logs de subagente, não o conteúdo da conversa (que está no banco). Se precisar deles em outro lugar, copie à mão.
 
 ## Configuração única: Google Cloud (~10 minutos, uma vez)
 

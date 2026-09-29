@@ -13,7 +13,10 @@ Marketplace ZCode do plugin **zcode-sync**: sincroniza recursos do `~/.zcode` en
 
 ## O que sincroniza
 
-`skills/`, `agents/`, `commands/`, `AGENTS.md` e `cli/memories/` — whitelist fechada. Configurações locais, sessões e credenciais nunca saem da máquina.
+- **Recursos**: `skills/`, `agents/`, `commands/`, `AGENTS.md` e `cli/memories/`.
+- **Configurações** com merge estrutural (chave/campo): `v2/setting.json`, `cli/config.json` (hooks/MCP), `agents-state` e configs de provider.
+- **Sessões e projetos**: o banco de sessões inteiro comprimido, o índice de tarefas da barra lateral e o código dos projetos (bundles do git) — com os **caminhos traduzidos entre as máquinas**: o projeto clone aparece no ZCode com as sessões dele.
+- As listas de abas/recentes de cada máquina ficam locais. Credenciais e tokens nunca saem da máquina.
 
 ## Documentação completa
 

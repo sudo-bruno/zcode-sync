@@ -5,6 +5,7 @@
 import argparse
 import gzip
 import glob
+import hashlib
 import json
 import os
 import shutil
@@ -732,6 +733,19 @@ CREATE TABLE tool_usage (
     retry_count integer not null default 0, retryable integer not null default 0,
     cancelled_by_user integer not null default 0, error_type text, error_code text, error_message text
 );
+CREATE TABLE input_history (
+    id text primary key, project_id text not null, session_id text, text text not null,
+    kind text not null, time_created integer not null, attachments text
+);
+CREATE TABLE permission (
+    project_id text primary key, time_created integer not null, time_updated integer not null,
+    data text not null
+);
+CREATE TABLE local_setting (
+    scope text not null, scope_id text not null, namespace text not null, key text not null,
+    value text not null, schema_version integer not null, time_created integer not null,
+    time_updated integer not null, primary key(scope, scope_id, namespace, key)
+);
 """
 
 TASKS_DDL = """
@@ -745,6 +759,46 @@ CREATE TABLE tasks (
     title_overridden INTEGER NOT NULL DEFAULT 0, meta_json TEXT NOT NULL DEFAULT '{}',
     searchable_text TEXT NOT NULL DEFAULT '', cron_automation_id TEXT, off_peak_task_id TEXT,
     PRIMARY KEY (workspace_key, task_id)
+);
+CREATE TABLE task_groups (
+    group_id TEXT PRIMARY KEY, title TEXT NOT NULL, color TEXT NOT NULL DEFAULT 'gray',
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE TABLE task_group_members (
+    group_id TEXT NOT NULL, workspace_key TEXT NOT NULL, workspace_path TEXT NOT NULL,
+    workspace_identity TEXT, task_id TEXT NOT NULL, sort_order INTEGER, added_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (workspace_key, task_id)
+);
+CREATE TABLE task_group_workspace_bootstraps (
+    workspace_key TEXT PRIMARY KEY, group_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE TABLE task_group_view_node_orders (
+    node_type TEXT NOT NULL, node_key TEXT NOT NULL, sort_order INTEGER NOT NULL,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (node_type, node_key)
+);
+CREATE TABLE automations (
+    automation_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', cron_expr TEXT NOT NULL,
+    prompt TEXT NOT NULL, model TEXT, provider TEXT, mode TEXT, thought_level TEXT,
+    workspace_key TEXT NOT NULL, workspace_path TEXT NOT NULL, workspace_identity TEXT,
+    target_task_id TEXT, bot_delivery_target TEXT, location_kind TEXT NOT NULL DEFAULT 'local',
+    recurring INTEGER NOT NULL DEFAULT 1, max_runs INTEGER, end_at INTEGER, schedule_rule TEXT,
+    schedule_edited_by_user INTEGER NOT NULL DEFAULT 0, run_count INTEGER NOT NULL DEFAULT 0,
+    scheduled_run_count INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+    lifecycle_status TEXT NOT NULL DEFAULT 'active', next_run_at INTEGER, last_run_at INTEGER,
+    running INTEGER NOT NULL DEFAULT 0, claimed_at INTEGER, dispatch_status TEXT NOT NULL DEFAULT 'idle',
+    dispatch_attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER, last_error TEXT,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, model_selection TEXT
+);
+CREATE TABLE off_peak_tasks (
+    off_peak_task_id TEXT PRIMARY KEY, server_ticket_id TEXT, title TEXT NOT NULL DEFAULT '',
+    conversation_id TEXT, session_id TEXT, prompt TEXT NOT NULL, permission_mode TEXT NOT NULL,
+    model TEXT, thought_level TEXT, workspace_key TEXT NOT NULL, workspace_path TEXT NOT NULL,
+    workspace_identity TEXT, status TEXT NOT NULL, queued_at INTEGER NOT NULL, started_at INTEGER,
+    ended_at INTEGER, failure_reason TEXT, files_changed INTEGER, settled_at INTEGER,
+    history_deleted_at INTEGER, registered_at INTEGER, schedulable INTEGER NOT NULL DEFAULT 0,
+    queue_position INTEGER, next_poll_at INTEGER, claim_running INTEGER NOT NULL DEFAULT 0,
+    claimed_at INTEGER, attempt_count INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, model_selection TEXT
 );
 """
 
@@ -1284,6 +1338,427 @@ def unit_db_sync():
         shutil.rmtree(base, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# Unit 0.14.0: espelho de projetos (tradução de caminhos entre máquinas)
+# ---------------------------------------------------------------------------
+
+MAC_PROJ = "/Volumes/WS/Works/SunshineRec"
+MAC_CONV = "/home/bruno/.zcode/workspace/default"
+
+
+class _FB:
+    """Backend de diretório no formato dos testes de db_sync."""
+
+    def __init__(self, root):
+        self.root = root
+        os.makedirs(root, exist_ok=True)
+
+    def put_named(self, n, d):
+        p = os.path.join(self.root, n)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "wb").write(d)
+
+    def get_named(self, n):
+        p = os.path.join(self.root, n)
+        return open(p, "rb").read() if os.path.exists(p) else None
+
+    def list_objects(self):
+        return {os.path.relpath(p, self.root).replace(os.sep, "/"): os.path.getmtime(p)
+                for p in glob.glob(os.path.join(self.root, "**", "*"), recursive=True)
+                if os.path.isfile(p)}
+
+    def delete_object(self, n):
+        p = os.path.join(self.root, n)
+        if os.path.exists(p):
+            os.remove(p)
+            return True
+        return False
+
+
+def _mirror_fixture(base, machine, project_local, device="linux", peer="MacBook"):
+    """Uma 'máquina' com manifesto, ack da outra ponta (o caminho do Mac), o
+    estado do clone local e os dois bancos com o schema real."""
+    root = os.path.join(base, machine, ".zcode")
+    data = os.path.join(base, machine, "data")
+    os.makedirs(os.path.join(root, "v2"))
+    os.makedirs(os.path.join(root, "cli", "db"))
+    os.makedirs(os.path.join(root, "workspace", "default"))
+    os.makedirs(os.path.join(root, "cli", "zsync-projects", "pid1"))
+    os.makedirs(data)
+    with open(os.path.join(root, "zsync-projects.json"), "w") as f:
+        json.dump({"format": 2, "projects": [
+            {"id": "pid1", "name": "SunshineRec", "origin": "git@forgejo:bruno/SunshineRec.git"}]}, f)
+    if project_local:
+        os.makedirs(project_local, exist_ok=True)
+        with open(os.path.join(data, "projects-local.json"), "w") as f:
+            json.dump({"pid1": {"path": project_local}}, f)
+    with open(os.path.join(root, "cli", "zsync-projects", "pid1", "ack-%s.json" % peer), "w") as f:
+        json.dump({"device": peer, "path": MAC_PROJ, "tips": {"main": "abc"}}, f)
+    with open(os.path.join(data, "device.json"), "w") as f:
+        json.dump({"device": device}, f)
+    db = os.path.join(root, "cli", "db", "db.sqlite")
+    c = sqlite3.connect(db)
+    c.executescript(SESSIONS_DDL)
+    c.commit()
+    c.close()
+    tk = os.path.join(root, "v2", "tasks-index.sqlite")
+    c = sqlite3.connect(tk)
+    c.executescript(TASKS_DDL)
+    c.commit()
+    c.close()
+    return root, data, db, tk
+
+
+def unit_mirror():
+    """0.14.0 — tradução de caminhos: o que veio da outra máquina passa a
+    apontar para o clone local (é o que faz o projeto aparecer no ZCode)."""
+    sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
+    import mirror  # noqa: E402
+
+    check("mirror: project_id idêntico ao do ZCode",
+          mirror.project_id_for(MAC_PROJ) == "proj_volumes-ws-works-sunshinerec")
+    check("mirror: project_id trunca em 80 como o ZCode",
+          mirror.project_id_for(MAC_PROJ + "/RestreamStudioAndroid/app/src/main/kotlin/pt/sunshinerec/studio")
+          == "proj_volumes-ws-works-sunshinerec-restreamstudioandroid-app-src-main-kotlin-pt-sunshi")
+    check("mirror: id de grupo de workspace = sha256[:24] como o ZCode",
+          mirror.workspace_group_id("/tmp/x") ==
+          "workspace-group-" + hashlib.sha256(b"/tmp/x").hexdigest()[:24])
+
+    base = tempfile.mkdtemp(prefix="zsync-mirror-")
+    try:
+        local = os.path.join(base, "linux", "Projetos", "SunshineRec")
+        root, data, db, tk = _mirror_fixture(base, "linux", local)
+        sub = MAC_PROJ + "/RestreamStudio"
+        conv_local = os.path.join(root, "workspace", "default")
+        t0, t1 = 1000, 2000
+
+        c = sqlite3.connect(db)
+        with c:
+            ins = ("insert into session (id, project_id, slug, directory, title, version,"
+                   " time_created, time_updated) values (?,?,?,?,?,?,?,?)")
+            c.execute(ins, ("sA", "proj_volumes-ws-works-sunshinerec", "re", MAC_PROJ, "A", "3.14.3", t0, t1))
+            c.execute(ins, ("sB", mirror.project_id_for(sub), "re", sub, "B", "3.14.3", t0, t1))
+            c.execute(ins, ("sC", mirror.project_id_for(local), "re", local, "C", "3.14.3", t0, t1))
+            c.execute(ins, ("sD", "proj_home-outro-proj", "re", "/home/outro/proj", "D", "3.14.3", t0, t1))
+            c.execute(ins, ("sE", "proj_home-bruno-.zcode-workspace-default", "re", MAC_CONV, "E", "3.14.3",
+                            t0, t1))
+            c.execute("insert into input_history (id, project_id, text, kind, time_created)"
+                      " values ('ih1','proj_volumes-ws-works-sunshinerec','x','prompt',?)", (t0,))
+            c.execute("insert into local_setting (scope, scope_id, namespace, key, value,"
+                      " schema_version, time_created, time_updated)"
+                      " values ('project','proj_volumes-ws-works-sunshinerec','permission','mode','{}',1,?,?)",
+                      (t0, t1))
+            c.execute("insert into permission (project_id, time_created, time_updated, data)"
+                      " values ('proj_volumes-ws-works-sunshinerec',?,?,'{}')", (t0, t1))
+        c.close()
+
+        tc = sqlite3.connect(tk)
+        old_group = mirror.workspace_group_id(MAC_PROJ)
+        with tc:
+            ins_t = ("insert into tasks (workspace_key, workspace_path, workspace_identity, task_id,"
+                     " title, meta_json, searchable_text, created_at, updated_at) values (?,?,?,?,?,?,?,?,?)")
+            tc.execute(ins_t, (MAC_PROJ, MAC_PROJ, None, "sA", "A",
+                               json.dumps({"workspacePath": MAC_PROJ}), MAC_PROJ, t0, t1))
+            tc.execute(ins_t, ("remote:ssh:1.2.3.4:22:onurb:/home/onurb/projetos/SunshineRec", MAC_PROJ,
+                               "remote:ssh:1.2.3.4:22:onurb:/home/onurb/projetos/SunshineRec", "sB", "B",
+                               "{}", "", t0, t1))
+            tc.execute(ins_t, ("/home/outro/proj", "/home/outro/proj", None, "sD", "D", "{}", "", t0, t1))
+            tc.execute(ins_t, (MAC_CONV, MAC_CONV, None, "sE", "E", "{}", "", t0, t1))
+            tc.execute("insert into task_groups values (?, 'SunshineRec', 'blue', ?, ?)", (old_group, t0, t1))
+            tc.execute("insert into task_group_members (group_id, workspace_key, workspace_path, task_id,"
+                       " added_at, created_at, updated_at) values (?,?,?,?,?,?,?)",
+                       (old_group, MAC_PROJ, MAC_PROJ, "sA", t0, t0, t1))
+            tc.execute("insert into task_group_workspace_bootstraps (workspace_key, group_id,"
+                       " created_at, updated_at) values (?,?,?,?)", (MAC_PROJ, old_group, t0, t1))
+            tc.execute("insert into task_group_view_node_orders (node_type, node_key, sort_order,"
+                       " created_at, updated_at) values ('task', ?, 1000, ?, ?)",
+                       (json.dumps([MAC_PROJ, "sA"], separators=(",", ":")), t0, t1))
+            tc.execute("insert into automations (automation_id, title, cron_expr, prompt, workspace_key,"
+                       " workspace_path, created_at, updated_at) values ('a1','t','0 9 * * *','p',?,?,?,?)",
+                       (MAC_PROJ, MAC_PROJ, t0, t1))
+            tc.execute("insert into off_peak_tasks (off_peak_task_id, title, prompt, permission_mode,"
+                       " workspace_key, workspace_path, status, queued_at, created_at, updated_at)"
+                       " values ('op1','t','p','build',?,?,'queued',?,?,?)", (MAC_PROJ, MAC_PROJ, t0, t0, t1))
+        tc.close()
+
+        with open(os.path.join(root, "v2", "setting.json"), "w") as f:
+            json.dump({"locale": "pt-BR", "recentProjects": ["/home/linux/outro"]}, f)
+
+        r = mirror.apply(root, data, "linux")
+        check("mirror: apply traduz linhas", r["translated"] > 0, str(r))
+
+        c = sqlite3.connect(db)
+        check("mirror: sessão do projeto religada ao clone local",
+              c.execute("select project_id, directory from session where id='sA'").fetchone()
+              == (mirror.project_id_for(local), local))
+        check("mirror: subdiretório herda o prefixo local",
+              c.execute("select directory from session where id='sB'").fetchone()[0]
+              == os.path.join(local, "RestreamStudio"))
+        check("mirror: sessão já local não é tocada",
+              c.execute("select directory, project_id from session where id='sC'").fetchone()
+              == (local, mirror.project_id_for(local)))
+        check("mirror: workspace desconhecido não é tocado",
+              c.execute("select directory from session where id='sD'").fetchone()[0] == "/home/outro/proj")
+        check("mirror: workspace de conversa vira o local",
+              c.execute("select directory, project_id from session where id='sE'").fetchone()
+              == (conv_local, mirror.project_id_for(conv_local)))
+        check("mirror: input_history religado",
+              c.execute("select project_id from input_history where id='ih1'").fetchone()[0]
+              == mirror.project_id_for(local))
+        check("mirror: permissões por projeto religadas",
+              c.execute("select scope_id from local_setting where scope='project'").fetchone()[0]
+              == mirror.project_id_for(local))
+        check("mirror: permission religado",
+              c.execute("select project_id from permission").fetchone()[0] == mirror.project_id_for(local))
+        c.close()
+
+        tc = sqlite3.connect(tk)
+        check("mirror: tarefa do workspace remoto vira local (identity NULL)",
+              tc.execute("select workspace_key, workspace_path, workspace_identity from tasks"
+                         " where task_id='sB'").fetchone() == (local, local, None))
+        meta = tc.execute("select meta_json from tasks where task_id='sA'").fetchone()[0]
+        check("mirror: meta_json com o caminho traduzido", MAC_PROJ not in meta and local in meta, meta)
+        check("mirror: grupo de workspace com hash recomputado",
+              tc.execute("select group_id from task_groups").fetchone()[0] == mirror.workspace_group_id(local))
+        check("mirror: membership/bootstraps/ordem acompanham o grupo",
+              tc.execute("select group_id from task_group_members").fetchone()[0] == mirror.workspace_group_id(local)
+              and tc.execute("select group_id from task_group_workspace_bootstraps").fetchone()[0]
+              == mirror.workspace_group_id(local)
+              and tc.execute("select node_key from task_group_view_node_orders").fetchone()[0]
+              == json.dumps([local, "sA"], separators=(",", ":")))
+        check("mirror: automação e tarefa ociosa religadas",
+              tc.execute("select workspace_key from automations").fetchone()[0] == local
+              and tc.execute("select workspace_path from off_peak_tasks").fetchone()[0] == local)
+        check("mirror: workspace desconhecido do índice intacto",
+              tc.execute("select workspace_path from tasks where task_id='sD'").fetchone()[0] == "/home/outro/proj")
+        tc.close()
+
+        with open(os.path.join(root, "v2", "setting.json")) as f:
+            d = json.load(f)
+        check("mirror: projeto entra nos recentes (na frente)",
+              d["recentProjects"][0] == local and "/home/linux/outro" in d["recentProjects"], str(d))
+
+        r2 = mirror.apply(root, data, "linux")
+        check("mirror: idempotente (2ª passada não muda nada)",
+              r2["translated"] == 0 and not r2["lines"], str(r2))
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def unit_tasks_sync():
+    """0.14.0 — o índice de tarefas viaja comprimido e chega TRADUZIDO."""
+    sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
+    import db_sync  # noqa: E402
+
+    base = tempfile.mkdtemp(prefix="zsync-tasks-")
+    try:
+        backend = _FB(os.path.join(base, "backend"))
+        root1, data1, _db1, tk1 = _mirror_fixture(base, "mac", None, device="MacBook", peer="MacBook")
+        t0, t1 = 1000, 2000
+        tc = sqlite3.connect(tk1)
+        with tc:
+            ins = ("insert into tasks (workspace_key, workspace_path, task_id, title, created_at,"
+                   " updated_at) values (?,?,?,?,?,?)")
+            tc.execute(ins, (MAC_PROJ, MAC_PROJ, "sA", "A", t0, t1))
+            tc.execute(ins, ("/home/mac/so-na-mac", "/home/mac/so-na-mac", "sX", "X", t0, t1))
+        tc.close()
+
+        r = db_sync.tasks_snapshot_upload(root1, data1, backend, "MacBook")
+        check("tarefas: snapshot do índice sobe comprimido",
+              r["ok"] and any("índice comprimido" in l for l in r["lines"]), str(r))
+        db_sync.tasks_snapshot_upload(root1, data1, backend, "MacBook")
+        check("tarefas: snapshot idêntico não re-envia",
+              len([n for n in backend.list_objects() if n.startswith("tasks/MacBook/")]) == 1)
+
+        local = os.path.join(base, "linux", "Projetos", "SunshineRec")
+        root2, data2, _db2, tk2 = _mirror_fixture(base, "linux", local, device="linux", peer="MacBook")
+        r = db_sync.tasks_merge_peers(root2, data2, backend, "linux")
+        tc = sqlite3.connect(tk2)
+        check("tarefas: linha chega traduzida para o clone local",
+              tc.execute("select workspace_key, workspace_path from tasks where task_id='sA'").fetchone()
+              == (local, local), str(r))
+        check("tarefas: workspace que só existe na outra máquina é pulado",
+              tc.execute("select count(*) from tasks where task_id='sX'").fetchone()[0] == 0)
+        tc.close()
+        r = db_sync.tasks_merge_peers(root2, data2, backend, "linux")
+        tc = sqlite3.connect(tk2)
+        check("tarefas: re-merge é idempotente",
+              tc.execute("select count(*) from tasks").fetchone()[0] == 1, str(r))
+        tc.close()
+
+        for i in range(3):
+            tc = sqlite3.connect(tk1)
+            with tc:
+                tc.execute("insert into tasks (workspace_key, workspace_path, task_id, title, created_at,"
+                           " updated_at) values (?,?,?,?,?,?)", (MAC_PROJ, MAC_PROJ, "p%d" % i, "P", t0, t1))
+            tc.close()
+            db_sync.tasks_snapshot_upload(root1, data1, backend, "MacBook")
+        check("tarefas: poda mantém 2 snapshots por máquina",
+              len([n for n in backend.list_objects() if n.startswith("tasks/MacBook/")]) == 2)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def unit_views():
+    """0.14.0 — setting.json: listas de workspace são por máquina e o sync
+    converge (sem ficar girando versões do manifesto)."""
+    rel = os.path.join("v2", "setting.json")
+    raw = json.dumps({"locale": "en-US", "recentProjects": ["/Users/x/p1"],
+                      "lastWorkspaceSession": [{"kind": "local", "workspacePath": "/Users/x/p1"}],
+                      "lastActiveTabIndex": 0}, indent=2).encode()
+    exported = zsync.view_export(rel, raw)
+    check("views: campos por máquina saem do que viaja",
+          b"recentProjects" not in exported and b"lastWorkspaceSession" not in exported
+          and b"locale" in exported, exported[:120])
+    d = json.loads(zsync.view_import(rel, exported, raw))
+    check("views: campos locais voltam no disco",
+          d.get("recentProjects") == ["/Users/x/p1"] and d.get("locale") == "en-US", str(d))
+    check("views: export estável (mesmos bytes em qualquer máquina)",
+          zsync.view_export(rel, zsync.view_import(rel, exported, raw)) == exported)
+
+    lab = Lab()
+    try:
+        lab.write("m1", "v2/setting.json", json.dumps(
+            {"locale": "en-US", "keyM1": True, "recentProjects": ["/m1/proj"]}, indent=2))
+        lab.write("m2", "v2/setting.json", json.dumps(
+            {"locale": "en-US", "keyM2": True, "recentProjects": ["/m2/proj"]}, indent=2))
+
+        def ver():
+            with open(os.path.join(lab.backend, "manifest.json")) as f:
+                return json.load(f)["version"]
+
+        lab.run("m1", "sync")   # primeira máquina sobe tudo (v1)
+        lab.run("m2", "sync")   # mescla estrutural (une as chaves) → push v2
+        lab.run("m1", "sync")   # aplica o mesclado (sem push — conteúdo igual)
+        lab.run("m2", "sync")
+        v1 = ver()
+        lab.run("m1", "sync")
+        lab.run("m2", "sync")
+        v2 = ver()
+        check("views: convergido, o sync para de girar versões", v1 == v2, "%s → %s" % (v1, v2))
+        d1 = json.loads(lab.read("m1", "v2/setting.json"))
+        d2 = json.loads(lab.read("m2", "v2/setting.json"))
+        check("views: merge uniu as chaves dos dois lados", bool(d1.get("keyM1")) and bool(d1.get("keyM2")),
+              str(d1))
+        check("views: recentes de cada máquina não viajaram",
+              d1["recentProjects"] == ["/m1/proj"] and d2["recentProjects"] == ["/m2/proj"],
+              str((d1.get("recentProjects"), d2.get("recentProjects"))))
+    finally:
+        lab.cleanup()
+
+
+def integration_mirror():
+    """0.14.0 — ponta a ponta: o Mac sobe banco+índice; o Linux sincroniza e o
+    projeto aparece com as sessões (caminhos traduzidos para o clone local) —
+    e a volta também funciona (sessão criada no Linux chega traduzida ao Mac)."""
+    sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
+    import mirror  # noqa: E402
+
+    lab = Lab()
+    try:
+        mac_proj = os.path.join(lab.base, "m1", "Volumes", "WS", "SunshineRec")
+        lin_proj = os.path.join(lab.base, "m2", "Projetos", "SunshineRec")
+
+        def mk_repo(path):
+            os.makedirs(path, exist_ok=True)
+            with open(os.path.join(path, "README.md"), "w") as f:
+                f.write("x\n")
+            subprocess.run(["git", "-C", path, "init", "-q"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", path, "add", "-A"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", path, "-c", "user.name=t", "-c", "user.email=t@t",
+                            "commit", "-qm", "init"], check=True, capture_output=True)
+
+        def mk_banks(root, session_dir, session_id, task_ws):
+            os.makedirs(os.path.join(root, "cli", "db"), exist_ok=True)
+            os.makedirs(os.path.join(root, "v2"), exist_ok=True)
+            c = sqlite3.connect(os.path.join(root, "cli", "db", "db.sqlite"))
+            c.executescript(SESSIONS_DDL)
+            with c:
+                c.execute("insert into session (id, project_id, slug, directory, title, version,"
+                          " time_created, time_updated) values (?,?,?,?,?,?,?,?)",
+                          (session_id, mirror.project_id_for(session_dir), "re", session_dir,
+                           "S", "3.14.3", 1000, 2000))
+            c.close()
+            tc = sqlite3.connect(os.path.join(root, "v2", "tasks-index.sqlite"))
+            tc.executescript(TASKS_DDL)
+            with tc:
+                tc.execute("insert into tasks (workspace_key, workspace_path, task_id, title,"
+                           " created_at, updated_at) values (?,?,?,?,?,?)",
+                           (task_ws, task_ws, session_id, "S", 1000, 2000))
+            tc.close()
+
+        def mk_state(m, path):
+            with open(lab.path(m, "zsync-projects.json"), "w") as f:
+                json.dump({"format": 2, "projects": [
+                    {"id": "pid1", "name": "SunshineRec", "origin": ""}]}, f)
+            with open(os.path.join(lab.data(m), "projects-local.json"), "w") as f:
+                json.dump({"pid1": {"path": path}}, f)
+            with open(os.path.join(lab.data(m), "auth.json"), "w") as f:
+                json.dump({"refresh_token": "teste"}, f)
+
+        mk_repo(mac_proj)
+        mk_banks(lab.root("m1"), mac_proj, "sMac", mac_proj)
+        mk_state("m1", mac_proj)
+
+        mk_repo(lin_proj)
+        mk_banks(lab.root("m2"), lin_proj, "sLin", lin_proj)
+        mk_state("m2", lin_proj)
+        with open(lab.path("m2", "v2/setting.json"), "w") as f:
+            json.dump({"locale": "pt-BR", "recentProjects": []}, f)
+
+        r = lab.run("m1", "sync", ["--pull-projects"])
+        check("espelho: m1 sincroniza sem erro", r.get("ok"), str(r)[:300])
+        r = lab.run("m2", "sync", ["--pull-projects"])
+        check("espelho: m2 sincroniza sem erro", r.get("ok"), str(r)[:300])
+
+        c = sqlite3.connect(lab.path("m2", "cli/db/db.sqlite"))
+        row = c.execute("select project_id, directory from session where id='sMac'").fetchone()
+        crow = c.execute("select count(*) from session where id='sLin'").fetchone()[0]
+        c.close()
+        check("espelho: sessão do Mac vira sessão do clone local",
+              row == (mirror.project_id_for(lin_proj), lin_proj), str(row))
+        check("espelho: sessão local intacta", crow == 1)
+
+        tc = sqlite3.connect(lab.path("m2", "v2/tasks-index.sqlite"))
+        trow = tc.execute("select workspace_key from tasks where task_id='sMac'").fetchone()
+        tc.close()
+        check("espelho: tarefa do Mac aparece no workspace local",
+              trow == (lin_proj,), str(trow))
+        with open(lab.path("m2", "v2/setting.json")) as f:
+            d = json.load(f)
+        check("espelho: projeto adicionado aos recentes do ZCode",
+              d["recentProjects"][:1] == [lin_proj], str(d.get("recentProjects")))
+
+        # volta: o Mac recebe a sessão criada no Linux, traduzida para o caminho dele
+        r = lab.run("m1", "sync")
+        check("espelho: m1 sincroniza a volta sem erro", r.get("ok"), str(r)[:300])
+        c = sqlite3.connect(lab.path("m1", "cli/db/db.sqlite"))
+        row = c.execute("select project_id, directory from session where id='sLin'").fetchone()
+        mac_own = c.execute("select directory from session where id='sMac'").fetchone()[0]
+        c.close()
+        check("espelho: sessão do Linux chega ao Mac no caminho dele",
+              row == (mirror.project_id_for(mac_proj), mac_proj), str(row))
+        check("espelho: sessão própria do Mac não foi mexida", mac_own == mac_proj)
+        tc = sqlite3.connect(lab.path("m1", "v2/tasks-index.sqlite"))
+        trow = tc.execute("select workspace_key from tasks where task_id='sLin'").fetchone()
+        tc.close()
+        check("espelho: tarefa do Linux chega ao Mac no workspace dele",
+              trow == (mac_proj,), str(trow))
+
+        # idempotente: rodar de novo não duplica nem erra
+        r = lab.run("m2", "sync")
+        c = sqlite3.connect(lab.path("m2", "cli/db/db.sqlite"))
+        n_sess = c.execute("select count(*) from session").fetchone()[0]
+        c.close()
+        tc = sqlite3.connect(lab.path("m2", "v2/tasks-index.sqlite"))
+        n_task = tc.execute("select count(*) from tasks").fetchone()[0]
+        tc.close()
+        check("espelho: re-sync idempotente", r.get("ok") and n_sess == 2 and n_task == 2,
+              "%s %s %s" % (r.get("ok"), n_sess, n_task))
+    finally:
+        lab.cleanup()
+
+
 def unit_zero_commands():
     """0.13.0 — auto-clone pela opção projectsDir + aviso de reload + /zsync:tudo."""
     lab = Lab()
@@ -1362,9 +1837,13 @@ def main():
     unit_p2()
     unit_prune()
     unit_db_sync()
+    unit_mirror()
+    unit_tasks_sync()
+    unit_views()
     unit_zero_commands()
     integration()
     integration_p1()
+    integration_mirror()
     print("")
     print("PASS: %d  FAIL: %d" % (len(PASS), len(FAIL)))
     if FAIL:

@@ -554,7 +554,9 @@ def recent_projects(root):
 
 
 def register_recent(root, paths):
-    """Adiciona caminhos materializados aos recentes locais (aparecem no ZCode)."""
+    """Adiciona caminhos materializados aos recentes locais (aparecem no ZCode).
+    Prepõe os que faltam: o app corta a lista em 10 ao reescrevê-la, então quem
+    chegou agora fica na frente e não é descartado no próximo ciclo da UI."""
     p = os.path.join(root, "v2", "setting.json")
     if not paths or not os.path.exists(p):
         return 0
@@ -563,13 +565,15 @@ def register_recent(root, paths):
             d = json.load(f)
     except (OSError, ValueError):
         return 0
+    if not isinstance(d, dict):
+        return 0
     rp = d.get("recentProjects")
     if not isinstance(rp, list):
         rp = []
     added = [x for x in paths if x not in rp]
     if not added:
         return 0
-    d["recentProjects"] = rp + added
+    d["recentProjects"] = added + rp
     tmp = p + ".tmp-zsync"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=2)

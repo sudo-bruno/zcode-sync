@@ -1,7 +1,7 @@
 {
   "name": "zcode-sync",
-  "version": "0.13.0",
-  "description": "Sincroniza skills, agents, commands, AGENTS.md, memórias, sessões (export enxuto em gzip) e lista de projetos (clone/pull via git) entre máquinas via Google Drive, com merge estilo git, hooks automáticos e comandos /zsync:* sem passar pelo modelo. Configs de providers ficam por máquina.",
+  "version": "0.14.0",
+  "description": "Sincroniza skills, agents, commands, AGENTS.md, memórias, sessões, banco, índice de tarefas e o CÓDIGO dos projetos entre máquinas via Google Drive. Projetos aparecem no ZCode com as sessões: os caminhos de cada máquina são traduzidos automaticamente (espelho). Merge estilo git, hooks automáticos e /zsync:* sem passar pelo modelo.",
   "author": {
     "name": "Bruno"
   },
@@ -30,12 +30,18 @@
       "type": "boolean",
       "default": true,
       "title": "Sincronizar configurações (merge inteligente)",
-      "description": "setting.json (projetos recentes), cli/config.json (hooks/MCP), agents-state e configs de provider sincronizam com merge por chave/campo: edições dos dois lados se preservam. Desligue para configs ficarem por máquina."
+      "description": "setting.json, cli/config.json (hooks/MCP), agents-state e configs de provider sincronizam com merge por chave/campo: edições dos dois lados se preservam. As listas de abas/recentes de cada máquina ficam locais. Desligue para configs ficarem por máquina."
     },
     "projectsDir": {
       "type": "directory",
       "title": "Pasta dos projetos (clonagem automática)",
       "description": "Se um projeto compartilhado não existir nesta máquina, ele é clonado automaticamente para cá no próximo sync (ex.: ~/Projetos). Vazio = não clonar sozinho."
+    },
+    "mirrorProjects": {
+      "type": "boolean",
+      "default": true,
+      "title": "Espelhar projetos (sessões e tarefas entre máquinas)",
+      "description": "Traduz os caminhos da outra máquina para os desta: o banco de sessões, o índice de tarefas (barra lateral) e as permissões por projeto passam a apontar para o clone local — o projeto aparece no ZCode com as sessões dele. Desligue para manter cada máquina isolada."
     }
   }
 }

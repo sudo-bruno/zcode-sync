@@ -31,7 +31,7 @@ import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-VERSION = "0.12.0"
+VERSION = "0.14.0"
 
 OAUTH_AUTH = "https://accounts.google.com/o/oauth2/v2/auth"
 OAUTH_TOKEN = "https://oauth2.googleapis.com/token"
@@ -65,6 +65,14 @@ CONFIG_FILES = {os.path.join("v2", "setting.json"), os.path.join("cli", "config.
 # Mecanismo de defesa: caminhos aqui NUNCA são escritos pelo motor (hoje vazio;
 # os configs de provider agora sincronizam via merge estrutural).
 NEVER_SYNC = set()
+
+# 0.14.0 — chaves do setting.json que são POR MÁQUINA: abas abertas e recentes
+# apontam para caminhos absolutos locais. Elas NÃO viajam no blob (o sync vê uma
+# versão canônica sem elas) e o arquivo em disco mantém as suas — sem isso, Mac e
+# Linux ficariam em ping-pong eterno regravando o setting.json (cada lado com o
+# seu caminho) e o merge nunca convergiria.
+HIDDEN_LOCAL_KEYS = {os.path.join("v2", "setting.json"):
+                     ("lastWorkspaceSession", "recentProjects", "lastActiveTabIndex")}
 
 IGNORE_NAMES = {".DS_Store", "__pycache__", ".git"}
 IGNORE_SUFFIXES = (".pyc",)
@@ -517,12 +525,16 @@ class FileBackend:
             return f.read()
 
     def list_objects(self):
+        """Tudo no diretório-raiz: blobs (objects/) e objetos nomeados
+        (db/, tasks/, bundles/) — a mesma visão de uma listagem do Drive."""
         out = {}
-        objdir = os.path.join(self.root, "objects")
-        for name in os.listdir(objdir):
-            p = os.path.join(objdir, name)
-            if os.path.isfile(p):
-                out["objects/" + name] = os.path.getmtime(p)
+        for dirpath, _dirnames, filenames in os.walk(self.root):
+            for name in filenames:
+                p = os.path.join(dirpath, name)
+                rel = os.path.relpath(p, self.root).replace(os.sep, "/")
+                if rel.startswith("."):
+                    continue
+                out[rel] = os.path.getmtime(p)
         return out
 
     def delete_object(self, name):
@@ -866,6 +878,8 @@ def _prune_candidates(ctx, backend, days):
             continue
         if name.startswith("bundles/"):
             continue  # bundles de código (0.10.0): gerenciados pelo fluxo de projetos
+        if name.startswith("db/") or name.startswith("tasks/"):
+            continue  # snapshots de banco/índice (0.12/0.14): poda própria (2 por máquina)
         candidates.append(name)
     return sorted(candidates)
 
@@ -988,6 +1002,58 @@ class _LoginHandler(BaseHTTPRequestHandler):
 # Scan do whitelist local
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Visão canônica de arquivos com campos por máquina (0.14.0)
+# --------------------------------------------------------------------------
+
+def _dumps_json(v):
+    return (json.dumps(v, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def view_export(rel, data):
+    """O que do arquivo viaja: remove as chaves por máquina do setting.json.
+    Determinístico — o mesmo conteúdo lógico gera os mesmos bytes nas duas
+    máquinas, então o merge converge e o sync não fica regravando."""
+    keys = HIDDEN_LOCAL_KEYS.get(rel)
+    if not keys:
+        return data
+    try:
+        v = json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        return data
+    if not isinstance(v, dict) or not any(k in v for k in keys):
+        return data
+    for k in keys:
+        v.pop(k, None)
+    return _dumps_json(v)
+
+
+def view_import(rel, data, local_raw):
+    """O que vai para o disco: a versão mesclada (canônica) + as chaves locais
+    atuais, preservadas como estavam."""
+    keys = HIDDEN_LOCAL_KEYS.get(rel)
+    if not keys:
+        return data
+    try:
+        v = json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        return data
+    if not isinstance(v, dict):
+        return data
+    try:
+        cur = json.loads(local_raw.decode("utf-8")) if local_raw else None
+    except (ValueError, UnicodeDecodeError):
+        cur = None
+    if not isinstance(cur, dict):
+        return data
+    changed = False
+    for k in keys:
+        if k in cur:
+            v[k] = cur[k]
+            changed = True
+    return _dumps_json(v) if changed else data
+
+
 def scan(root):
     """Retorna {caminho_relativo_posix: {"sha256":…, "size":…}} do whitelist."""
     files = {}
@@ -1022,7 +1088,10 @@ def _add_file(files, root, fpath):
     rel = rel.replace(os.sep, "/")
     if rel.startswith("..") or os.path.isabs(rel):
         raise SyncError("caminho fora da raiz (bug de scan): %s" % rel)
-    files[rel] = {"sha256": sha256_file(fpath), "size": os.path.getsize(fpath)}
+    with open(fpath, "rb") as f:
+        raw = f.read()
+    data = view_export(rel, raw)  # campos por máquina fora do que é comparado/enviado
+    files[rel] = {"sha256": sha256_bytes(data), "size": len(data)}
 
 
 # --------------------------------------------------------------------------
@@ -1134,12 +1203,18 @@ class Ctx:
 
     def read_local(self, rel):
         with open(self.local_path(rel), "rb") as f:
-            return f.read()
+            return view_export(rel, f.read())
 
     def write_local(self, rel, data):
         if rel in NEVER_SYNC:
             raise SyncError("defesa: %s é por máquina e nunca é escrito pelo sync (bug)" % rel)
         path = self.local_path(rel)
+        if rel in HIDDEN_LOCAL_KEYS:
+            raw = None
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    raw = f.read()
+            data = view_import(rel, data, raw)  # recoloca as chaves locais no disco
         if os.path.exists(path):
             with open(path, "rb") as f:
                 old = f.read()
@@ -1550,10 +1625,20 @@ def run_sync(ctx):
         report.add("aviso", "", "push adiado até resolver os conflitos com /zsync:resolve")
         return report, False
 
-    # sem conflitos → push do resultado rebased
+    # sem conflitos → push do resultado rebased. 0.14.0: só quando o CONTEÚDO
+    # mudou de fato — duas máquinas ativas ficavam girando versões do manifesto a
+    # cada sync (o remoto sempre "avançava" em relação ao estado local), sem
+    # nenhum byte novo. Se nada difere, só realinhamos o estado.
+    rebased = with_attribution(final, remote.get("files", {}), ctx.device)
+    same = all(rebased.get(p, {}).get("sha256") == (remote.get("files", {}) or {}).get(p, {}).get("sha256")
+               for p in set(rebased) | set(remote.get("files", {}) or {}))
+    if same:
+        ctx.save_state(remote["version"], {p: e["sha256"] for p, e in final.items()})
+        ctx.save_conflicts(pending)
+        return report, False
     version = remote["version"] + 1
     manifest = {"version": version, "updated": now_iso(), "device": ctx.device,
-                "files": with_attribution(final, remote.get("files", {}), ctx.device)}
+                "files": rebased}
     for rel, entry in sorted(final.items()):
         if not backend.has_object(entry["sha256"]):
             backend.put_object(entry["sha256"], ctx.read_local(rel))
@@ -1621,6 +1706,10 @@ def _sibling(name):
 
 def cmd_sync(ctx, args_json, args=None):
     pre = []
+    try:
+        mirror_on = read_plugin_options(ctx.root).get("mirrorProjects", True)
+    except Exception:
+        mirror_on = True
     if args is not None and getattr(args, "export_sessions", False):
         try:
             pre = _sibling("sessions").export(ctx.root, ctx.data_dir)["lines"]
@@ -1642,6 +1731,10 @@ def cmd_sync(ctx, args_json, args=None):
             r = _sibling("db_sync").snapshot_upload(ctx.root, ctx.data_dir, backend, ctx.device,
                                                     force=not auto_mode, auto=auto_mode)
             pre += r["lines"]
+            # 0.14.0: o índice de tarefas (projetos da barra lateral) sobe junto
+            r2 = _sibling("db_sync").tasks_snapshot_upload(ctx.root, ctx.data_dir, backend, ctx.device,
+                                                           force=not auto_mode, auto=auto_mode)
+            pre += r2["lines"]
         except Exception as e:
             pre.append("aviso: snapshot do banco falhou: %r" % e)
     lock = acquire_lock(ctx.data_dir)
@@ -1700,6 +1793,24 @@ def cmd_sync(ctx, args_json, args=None):
                         lines += si_lines
                 except Exception as e:
                     lines.append("aviso: import de sessões falhou: %r" % e)
+                # 0.14.0 — PROJETOS ESPELHADOS: o índice de tarefas da outra
+                # máquina chega com os caminhos TRADUZIDOS para os desta, e as
+                # sessões/tarefas já importadas são religadas ao clone local.
+                # É isso que faz o projeto aparecer no ZCode com as sessões dele.
+                if mirror_on and ctx.auth.creds():
+                    try:
+                        tm = _sibling("db_sync").tasks_merge_peers(ctx.root, ctx.data_dir,
+                                                                   get_backend(ctx), ctx.device)
+                        if tm["lines"]:
+                            lines += [""] + tm["lines"]
+                    except Exception as e:
+                        lines.append("aviso: merge do índice de tarefas falhou: %r" % e)
+                    try:
+                        mr = _sibling("mirror").apply(ctx.root, ctx.data_dir, ctx.device)
+                        if mr["lines"]:
+                            lines += mr["lines"]
+                    except Exception as e:
+                        lines.append("aviso: espelho de projetos falhou: %r" % e)
                 # sync trouxe recursos (skills/agents/commands/memórias)? avisa para recarregar
                 n_res = sum(1 for e in report.events
                             if e["type"] in ("baixado", "mesclado", "removido-local")

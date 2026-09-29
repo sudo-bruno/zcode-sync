@@ -4,8 +4,8 @@
     {
       "name": "zcode-sync",
       "source": "./zcode-sync",
-      "version": "0.13.0",
-      "description": "Sync completo entre máquinas SEM comandos: ao abrir/fechar tarefas o plugin sincroniza arquivos, configs (merge estrutural), código dos projetos (bundles git), clona o que falta e aplica o diff do banco inteiro. Um clique em /zsync:tudo força tudo agora. Google Drive privado; providers com merge por campo.",
+      "version": "0.14.0",
+      "description": "Sync completo entre máquinas SEM comandos: ao abrir/fechar tarefas o plugin sincroniza arquivos, configs (merge estrutural), código dos projetos (bundles git), o banco de sessões inteiro e o índice de tarefas — traduzindo os caminhos de cada máquina para que o projeto apareça no ZCode com as sessões dele. Clona o que falta sozinho. Um clique em /zsync:tudo força tudo agora. Google Drive privado.",
       "displayName": "ZCode Sync",
       "category": "utilities",
       "author": "Bruno Saraiva",

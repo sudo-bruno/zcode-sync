@@ -1,5 +1,5 @@
 ---
-description: Um clique, tudo: sync completo (arquivos, configs, código, banco) + clona projetos que faltam + importa sessões + avisa se precisa recarregar.
+description: Um clique, tudo: sync completo (arquivos, configs, código, banco e índice de tarefas) + clona projetos que faltam + faz os projetos aparecerem no ZCode (caminhos traduzidos) + importa sessões + avisa se precisa recarregar.
 ---
 
 zsync-cmd:tudo $ARGUMENTS
