@@ -463,6 +463,12 @@ def clone(root, data_dir, backend, device, into=None):
                     break
         if not dest:
             continue
+        if not into and not os.path.isdir(os.path.dirname(dest)):
+            # caminho da outra máquina não existe aqui (layouts diferentes):
+            # não criar caminhos estranhos na raiz — pedir o destino
+            lines.append("%s: caminho de origem (%s) não existe nesta máquina — rode /zsync:projects clone --into <pasta>"
+                         % (name, dest))
+            continue
         if os.path.isdir(dest):
             if repo_ok(dest):
                 st[pid] = {"path": dest, "last_bundled": {}, "applied": {}}
@@ -484,6 +490,10 @@ def clone(root, data_dir, backend, device, into=None):
                 parent = os.path.dirname(dest)
                 if parent:
                     os.makedirs(parent, exist_ok=True)
+            except OSError as e:
+                lines.append("%s: falha ao criar destino (%s)" % (name, e))
+                continue
+            try:
                 r = subprocess.run(["git", "clone", "-q", tmp, dest],
                                    capture_output=True, text=True, timeout=GIT_TIMEOUT)
             finally:
