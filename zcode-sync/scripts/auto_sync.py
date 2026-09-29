@@ -82,6 +82,7 @@ def spawn_sync(log, root):
         [py, ZSYNC, "--root", root, "sync", "--export-sessions", "--pull-projects"],
         stdout=f, stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL, start_new_session=True,
+        env=dict(os.environ, ZSYNC_AUTO="1"),
     )
     f.close()
 

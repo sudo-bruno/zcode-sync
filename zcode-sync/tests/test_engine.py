@@ -1161,6 +1161,129 @@ def unit_prune():
         lab.cleanup()
 
 
+def unit_db_sync():
+    """0.12.0 — banco inteiro comprimido no Drive + diff por linha na outra ponta."""
+    sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
+    import db_sync  # noqa: E402
+
+    base = tempfile.mkdtemp(prefix="zsync-db-")
+    try:
+        backend_root = os.path.join(base, "backend")
+        class FB:
+            def __init__(s, r):
+                s.root = r
+                os.makedirs(r, exist_ok=True)
+            def put_named(s, n, d):
+                p = os.path.join(s.root, n)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                open(p, "wb").write(d)
+            def get_named(s, n):
+                p = os.path.join(s.root, n)
+                return open(p, "rb").read() if os.path.exists(p) else None
+            def list_objects(s):
+                return {os.path.relpath(p, s.root).replace(os.sep, "/"): os.path.getmtime(p)
+                        for p in glob.glob(os.path.join(s.root, "**", "*"), recursive=True)
+                        if os.path.isfile(p)}
+            def delete_object(s, n):
+                p = os.path.join(s.root, n)
+                if os.path.exists(p):
+                    os.remove(p); return True
+                return False
+        backend = FB(backend_root)
+
+        def mk_machine(m):
+            root = os.path.join(base, m, ".zcode")
+            os.makedirs(os.path.join(root, "cli", "db"))
+            st = os.path.join(base, m, "st")
+            os.makedirs(st)
+            db = os.path.join(root, "cli", "db", "db.sqlite")
+            c = sqlite3.connect(db)
+            c.executescript("""
+                create table session (id text primary key, title text, time_updated int);
+                create table message (id text primary key, session_id text, text text);
+                create table nokey (value text);
+            """)
+            c.commit()
+            return root, st, db
+
+        def add_rows(db, sid, title, msg):
+            c = sqlite3.connect(db)
+            with c:
+                c.execute("insert or ignore into session values (?,?,?)", (sid, title, 1))
+                c.execute("insert or ignore into message values (?,?,?)", (sid + "-m", sid, msg))
+            c.close()
+
+        root1, st1, db1 = mk_machine("m1")
+        root2, st2, db2 = mk_machine("m2")
+        add_rows(db1, "s1", "Sessão da Mac", "conteúdo 1")
+        add_rows(db2, "s2", "Sessão da Linux", "conteúdo 2")
+
+        # m1 sobe snapshot; m2 sobe snapshot
+        r = db_sync.snapshot_upload(root1, st1, backend, "m1")
+        check("db: m1 sobe snapshot", r["ok"] and any("snapshot" in l for l in r["lines"]), str(r))
+        r = db_sync.snapshot_upload(root2, st2, backend, "m2")
+        check("db: m2 sobe snapshot", r["ok"], str(r))
+        names = [n for n in backend.list_objects() if n.startswith("db/")]
+        check("db: 2 snapshots no Drive", len(names) == 2, str(names))
+
+        # sem mudança, re-upload não cria objeto novo
+        r = db_sync.snapshot_upload(root1, st1, backend, "m1")
+        names = [n for n in backend.list_objects() if n.startswith("db/")]
+        check("db: snapshot idêntico não re-envia", len(names) == 2, str(r))
+
+        # m2 aplica o diff do banco da m1: ganha s1 sem perder s2
+        r = db_sync.merge_peers(root2, st2, backend, "m2")
+        c = sqlite3.connect(db2)
+        s1 = c.execute("select title from session where id='s1'").fetchone()
+        s2 = c.execute("select title from session where id='s2'").fetchone()
+        c.close()
+        check("db: diff traz a sessão da m1", s1 == ("Sessão da Mac",), str(r))
+        check("db: sessão local preservada", s2 == ("Sessão da Linux",), str(s2))
+        check("db: relatório do merge", any("diff de m1" in l for l in r["lines"]), str(r))
+
+        # idempotência: aplicar de novo = nada
+        r = db_sync.merge_peers(root2, st2, backend, "m2")
+        check("db: re-merge é no-op", not any("linha(s) nova(s)" in l for l in r["lines"]), str(r))
+
+        # mudança de um lado viaja no próximo snapshot
+        add_rows(db1, "s3", "Nova da Mac", "conteúdo 3")
+        db_sync.snapshot_upload(root1, st1, backend, "m1")
+        r = db_sync.merge_peers(root2, st2, backend, "m2")
+        c = sqlite3.connect(db2)
+        s3 = c.execute("select title from session where id='s3'").fetchone()
+        c.close()
+        check("db: incremental chega no diff", s3 == ("Nova da Mac",), str(r))
+
+        # poda: 3 snapshots da m1 → só os 2 últimos ficam no Drive
+        for i in range(3):
+            add_rows(db1, "s%d" % (10 + i), "t%d" % i, "x")
+            db_sync.snapshot_upload(root1, st1, backend, "m1")
+        names1 = [n for n in backend.list_objects() if n.startswith("db/m1/")]
+        check("db: poda mantém 2 snapshots por máquina", len(names1) == 2, str(names1))
+
+        # tabela sem chave única é pulada (evitaria duplicar linhas)
+        c = sqlite3.connect(db1)
+        with c:
+            c.execute("insert into nokey values ('x')")
+        c.close()
+        c = sqlite3.connect(db2)
+        with c:
+            c.execute("insert into nokey values ('y')")
+        c.close()
+        db_sync.snapshot_upload(root1, st1, backend, "m1")
+        r = db_sync.merge_peers(root2, st2, backend, "m2")
+        c = sqlite3.connect(db2)
+        nk = c.execute("select count(*) from nokey").fetchone()[0]
+        c.close()
+        check("db: tabela sem chave única não duplica", nk == 1, str(r))
+
+        # backup local criado antes do merge
+        backups = glob.glob(os.path.join(st2, "db-backup", "*.sqlite"))
+        check("db: backup do banco local antes do merge", len(backups) >= 1, str(backups))
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
 def main():
     unit_merge3()
     unit_merge_json3()
@@ -1173,6 +1296,7 @@ def main():
     unit_p1()
     unit_p2()
     unit_prune()
+    unit_db_sync()
     integration()
     integration_p1()
     print("")

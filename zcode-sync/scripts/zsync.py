@@ -31,7 +31,7 @@ import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 
 OAUTH_AUTH = "https://accounts.google.com/o/oauth2/v2/auth"
 OAUTH_TOKEN = "https://oauth2.googleapis.com/token"
@@ -1631,6 +1631,17 @@ def cmd_sync(ctx, args_json, args=None):
             pre += _sibling("projects").export_code(ctx.root, ctx.data_dir, backend, ctx.device)["lines"]
         except Exception as e:
             pre.append("aviso: export de código (projetos) falhou: %r" % e)
+    # 0.12.0: o BANCO inteiro comprimido sobe para o Google (manual: sempre que
+    # mudou; auto-sync: no máximo 1×/6h). O merge do lado de fora roda pós-sync.
+    if ctx.auth.creds():
+        auto_mode = os.environ.get("ZSYNC_AUTO") == "1"
+        try:
+            backend = get_backend(ctx)
+            r = _sibling("db_sync").snapshot_upload(ctx.root, ctx.data_dir, backend, ctx.device,
+                                                    force=not auto_mode, auto=auto_mode)
+            pre += r["lines"]
+        except Exception as e:
+            pre.append("aviso: snapshot do banco falhou: %r" % e)
     lock = acquire_lock(ctx.data_dir)
     try:
         last_err = None
@@ -1656,6 +1667,15 @@ def cmd_sync(ctx, args_json, args=None):
                             lines += [""] + imp["lines"]
                     except Exception as e:
                         lines.append("aviso: merge de código (projetos) falhou: %r" % e)
+                # 0.12.0: buscar snapshots de banco das outras máquinas e aplicar o diff
+                if ctx.auth.creds():
+                    try:
+                        m = _sibling("db_sync").merge_peers(ctx.root, ctx.data_dir,
+                                                            get_backend(ctx), ctx.device)
+                        if m["lines"]:
+                            lines += [""] + m["lines"]
+                    except Exception as e:
+                        lines.append("aviso: merge do banco falhou: %r" % e)
                 return out(args_json, ok=True, lines=lines,
                            events=report.events, pushed=pushed,
                            conflicts=ctx.conflicts())
@@ -1921,6 +1941,9 @@ def main(argv):
     prune_p.add_argument("--days", type=int, default=None,
                          help="janela de retenção em dias (padrão %d)" % PRUNE_MIN_AGE_DAYS)
     prune_p.add_argument("--dry-run", action="store_true", help="só lista o que seria apagado")
+    db_p = sub.add_parser("db")
+    db_p.add_argument("db_action", nargs="?", default="status",
+                      choices=["status", "upload", "merge"])
     args = ap.parse_args(argv)
 
     ctx = Ctx(args)
@@ -1944,6 +1967,15 @@ def main(argv):
             return cmd_resolve(ctx, args.json, args.path, args.choice)
         if args.cmd == "prune":
             return cmd_prune(ctx, args.json, days=args.days, dry_run=args.dry_run)
+        if args.cmd == "db":
+            mod = _sibling("db_sync")
+            if args.db_action == "upload":
+                r = mod.snapshot_upload(ctx.root, ctx.data_dir, get_backend(ctx), ctx.device, force=True)
+            elif args.db_action == "merge":
+                r = mod.merge_peers(ctx.root, ctx.data_dir, get_backend(ctx), ctx.device)
+            else:
+                r = mod.status(ctx.root, ctx.data_dir, get_backend(ctx), ctx.device)
+            return out(args.json, ok=r.get("ok", True), lines=r["lines"])
     except SyncError as e:
         return out(args.json, ok=False, lines=["Erro: %s" % e])
     return 2

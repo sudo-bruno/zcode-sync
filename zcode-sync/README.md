@@ -86,6 +86,7 @@ Depois de instalar ou atualizar o plugin, **reinicie o ZCode uma vez** — os ho
 | `/zsync:sessions [status\|export\|import]` | Sessões: estado, exportar agora, importar o que chegou |
 | `/zsync:projects [status\|scan\|clone\|pull]` | Projetos: lista sincronizada, remontar manifesto, clonar o que falta, puxar novidades |
 | `/zsync:prune` | Poda blobs antigos sem uso no Drive (automática 1×/dia; `--dry-run` lista) |
+| `/zsync:db [status\|upload\|merge]` | Banco inteiro: estado do snapshot, subir agora, aplicar o diff das outras máquinas |
 | `/zsync:logout` | Revoga o token no Google e limpa o Keychain |
 
 Os comandos **não passam pelo modelo**: o corpo de cada um é um marcador (`zsync-cmd:…`); um hook de `UserPromptSubmit` intercepta antes da IA, roda o motor e devolve a saída na tela. Se os hooks do plugin estiverem desativados (ou falharem), os comandos caem no modo antigo — o modelo executa e resume; nada quebra.
@@ -98,9 +99,11 @@ O ZCode não observa as pastas de recursos (não existe watcher) — skills/agen
 
 Preferencial: **Settings → Plugin Management → zcode-sync → Configurar → desligar "Sync automático"** (os comandos e o status da sessão continuam funcionando). Alternativa mais drástica: desativar os hooks do plugin — aí os comandos `/zsync:*` voltam ao modo modelo (fallback embutido). Os comandos manuais continuam existindo nos dois casos.
 
-## Sessões (histórico de conversas)
+## Sessões e o banco de dados inteiro
 
-O banco de sessões (sqlite) não viaja — não existe formato de merge para ele. Em vez disso o plugin **exporta cada sessão para um arquivo comprimido** (`.json.gz`, gzip determinístico) em `~/.zcode/cli/sessions-export/` (id UUID = nunca colide entre máquinas) e o sync leva esses arquivos como qualquer outro. Na outra máquina, `/zsync:sessions import` aplica o que falta por `INSERT OR IGNORE`: só adiciona, nunca altera nem apaga nada existente; faz backup do banco antes (mantém os 2 últimos) e funciona melhor com o ZCode fechado — as sessões aparecem após reiniciar o app.
+**O banco (`db.sqlite`) viaja INTEIRO, comprimido (0.12.0):** cada máquina sobe um snapshot próprio para o Drive (`db/<máquina>/<hash>.sqlite.gz` — guarda os 2 últimos; o seu banco de 1,4 GB fica ~355 MB comprimido). A outra máquina, no sync, **busca o snapshot e aplica o DIFF por linha** (`INSERT OR IGNORE`): só adiciona o que falta — nunca altera nem apaga o que já existe, é idempotente e inclui TUDO (outputs de ferramenta, estatísticas, checkpoints, arquivadas). Antes de aplicar, o banco local é copiado para `~/.zcode/cli/zsync/db-backup/` (2 últimos). O snapshot sobe a cada `/zsync:sync` manual (se o banco mudou) e no máximo 1×/6h no auto-sync. O merge escreve no banco: **mais seguro com o ZCode fechado** — `/zsync:db` (status/upload/merge).
+
+Além do banco inteiro, o plugin **exporta cada sessão para um arquivo comprimido** (`.json.gz`, gzip determinístico) em `~/.zcode/cli/sessions-export/` (id UUID = nunca colide entre máquinas) e o sync leva esses arquivos como qualquer outro. Na outra máquina, `/zsync:sessions import` aplica o que falta por `INSERT OR IGNORE`: só adiciona, nunca altera nem apaga nada existente; faz backup do banco antes (mantém os 2 últimos) e funciona melhor com o ZCode fechado — as sessões aparecem após reiniciar o app.
 
 - Recorte padrão (enxuto): **sem outputs de ferramenta** (~85% do peso), **sem tabelas de estatísticas**, **sem checkpoints** (apontam para artefatos que não viajam) e **sem sessões arquivadas**. Medido no histórico real: 384 MB → **68 MB** sem perder o conteúdo das conversas.
 - **Sessões importadas não são re-exportadas** pela máquina que as importou — o dono de cada sessão é a máquina que a criou (evita conflito quando a mesma sessão existe nas duas pontas).
